@@ -1,11 +1,17 @@
 #ifndef COUNTER_H
 #define COUNTER_H
 
-#include "c.h"
-#include "nodes/bitmapset.h"
-#include "nodes/pathnodes.h"
-#include "utils/hsearch.h"
+#include "postgres.h"
 
+#include <limits.h>
+#include "nodes/pathnodes.h"
+#include "nodes/pg_list.h"
+#include "optimizer/joininfo.h"
+#include "optimizer/paths.h"
+#include "utils/hsearch.h"
+/*
+ * Represents a hypernode in query graph
+ */
 typedef struct HyperNode {
 	/*
 	 * Bitmap of relations this Hypernode represents.
@@ -67,37 +73,6 @@ typedef struct EdgeArray {
 } EdgeArray;
 
 /*
- * Structure used as state for enumerating subsets of given bitmap
- */
-typedef struct SubsetIteratorState {
-	/* Common state for subset iteration */
-	/*
-	 * Current subset value
-	 */
-	bitmapword subset;
-	/*
-	 * Current subset to return. 0 means no more subsets.
-	 */
-	bitmapword state;
-	/*
-	 * Initial bitmap that used as mask to iterate.
-	 */
-	bitmapword init;
-
-	/* State to compute neighborhood using cache */
-	/*
-	 * Current iteration number. Used to decide which actions to take.
-	 */
-	bitmapword iteration;
-
-	/*
-	 * Cache of neighborhoods for different subsets.
-	 * Indexed by number of leading zeros in subset.
-	 */
-	bitmapword cached_neighborhood[BITS_PER_BITMAPWORD];
-} SubsetIteratorState;
-
-/*
  * Context object, that passed along with any function invocation.
  */
 typedef struct DPHypContext {
@@ -143,7 +118,38 @@ typedef struct DPHypContext {
 	HTAB *dptable;
 } DPHypContext;
 
-extern void initialize_edges(PlannerInfo *root, List *initial_rels,
-							 DPHypContext *context);
+/*
+ * Structure used as state for enumerating subsets of given bitmap
+ */
+typedef struct SubsetIteratorState {
+	/* Common state for subset iteration */
+	/*
+	 * Current subset value
+	 */
+	bitmapword subset;
+	/*
+	 * Current subset to return. 0 means no more subsets.
+	 */
+	bitmapword state;
+	/*
+	 * Initial bitmap that used as mask to iterate.
+	 */
+	bitmapword init;
+
+	/* State to compute neighborhood using cache */
+	/*
+	 * Current iteration number. Used to decide which actions to take.
+	 */
+	bitmapword iteration;
+
+	/*
+	 * Cache of neighborhoods for different subsets.
+	 * Indexed by number of leading zeros in subset.
+	 */
+	bitmapword cached_neighborhood[BITS_PER_BITMAPWORD];
+} SubsetIteratorState;
+
+extern void initialize_edges(PlannerInfo *root, List *initial_rels, DPHypContext *context);
 extern uint64 count_cc(DPHypContext *context, uint64 max);
+
 #endif

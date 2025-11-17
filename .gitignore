@@ -49,3 +49,9 @@ clang-tidy
 build/**
 .cache
 compile_commands.json
+
+.vscode
+.clang-format
+.clang-tidy
+src/backend/optimizer/heuristic/chern1
+src/backend/optimizer/heuristic/chern1
