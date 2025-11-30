@@ -25,7 +25,7 @@ extern List *build_join_graph(PlannerInfo *root, List *initial_rels);
 extern List *split_components(PlannerInfo *root, List *vertexes);
 extern List *find_cycles(PlannerInfo *root, List *vertexes, bool *used_vertexes_comp);
 extern List *find_stars(PlannerInfo *root, List *vertexes, bool *used_vertexes);
-extern List *find_remaining_chains(PlannerInfo *root, List *vertexes, bool *used_vertexes);
+extern List *find_chains(PlannerInfo *root, List *vertexes, bool *used_vertexes);
 extern List *find_dense_subgraphs(PlannerInfo *root, List *vertexes, bool *used_vertexes);
 extern void update_indices(Topology *component);
 extern Selectivity get_selectivity(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2);

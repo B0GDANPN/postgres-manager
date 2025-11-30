@@ -81,8 +81,7 @@ RelOptInfo *heuristic_join_search(PlannerInfo *root, List *initial_rels, int bud
 			topologies = list_concat(topologies, cycles);
 			List *stars = find_stars(root, comp_vertexes, used_vertexes);
 			topologies = list_concat(topologies, stars);
-			List *remaining_chains =
-				find_remaining_chains(root, comp_vertexes, used_vertexes);
+			List *remaining_chains = find_chains(root, comp_vertexes, used_vertexes);
 			topologies = list_concat(topologies, remaining_chains);
 			split_budget_among_topologies(topologies, current_budget);
 

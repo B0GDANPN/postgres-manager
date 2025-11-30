@@ -23,7 +23,7 @@ static const uint64 border_density_graph = 1000;
 
 static void set_complexity_topology(PlannerInfo *root, Topology *topology);
 static List *dfs_component(Vertex *v, List *comp, bool *used_vertexes);
-static List *dfs(Vertex *cur, List *stack, List *cycles, bool *visited,
+static List *dfs(Vertex *prev, Vertex *cur, List *stack, List *cycles, bool *visited,
 		 bool *used_vertexes_comp); // stack is list of Vertex*
 static bool is_star(Vertex *center, const bool *used_vertexes);
 static List *find_star(Vertex *center, bool *used_vertexes);
@@ -126,13 +126,17 @@ List *split_components(PlannerInfo *root, List *vertexes)
 	return comps;
 }
 
-static List *dfs(Vertex *cur, List *stack, List *cycles, bool *visited, bool *used_vertexes_comp)
+static List *dfs(Vertex *prev, Vertex *cur, List *stack, List *cycles, bool *visited,
+		 bool *used_vertexes_comp)
 {
 	visited[cur->index] = true;
 	stack = lappend(stack, cur);
 	ListCell *lc;
 	foreach (lc, cur->adj) {
 		Vertex *nbr = (Vertex *)lfirst(lc);
+		if (nbr == prev) {
+			continue;
+		}
 		if (visited[nbr->index] && stack->length >= 3) {
 			ListCell *start = &list_make_ptr_cell(nbr);
 			List *cycle = NIL;
@@ -146,7 +150,7 @@ static List *dfs(Vertex *cur, List *stack, List *cycles, bool *visited, bool *us
 			break;
 		}
 		if (!visited[nbr->index] && !used_vertexes_comp[nbr->index]) {
-			cycles = dfs(nbr, stack, cycles, visited, used_vertexes_comp);
+			cycles = dfs(cur, nbr, stack, cycles, visited, used_vertexes_comp);
 		}
 	}
 	visited[cur->index] = false;
@@ -167,7 +171,7 @@ List *find_cycles(PlannerInfo *root, List *vertexes, bool *used_vertexes_comp)
 			continue;
 		}
 		memset(visited, false, nverts_global * sizeof(bool));
-		cycles = dfs(v, stack, cycles, visited, used_vertexes_comp);
+		cycles = dfs(NULL, v, stack, cycles, visited, used_vertexes_comp);
 	}
 	List *cyclic_topologies = NIL;
 	foreach (lc, cycles) {
@@ -228,7 +232,7 @@ static List *find_star(Vertex *center, bool *used_vertexes)
 	return star;
 }
 
-List *find_remaining_chains(PlannerInfo *root, List *vertexes, bool *used_vertexes)
+List *find_chains(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 {
 	List *remaining_chains = NIL; // List* of Topology*
 	ListCell *lc;
@@ -243,7 +247,7 @@ List *find_remaining_chains(PlannerInfo *root, List *vertexes, bool *used_vertex
 			set_sel_topology(root, topology);
 			set_vol_topology(root, topology);
 			set_complexity_topology(root, topology);
-			remaining_chains = lappend(remaining_chains, sub);
+			remaining_chains = lappend(remaining_chains, topology);
 		}
 	}
 	return remaining_chains;
@@ -265,7 +269,7 @@ List *find_stars(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 		set_sel_topology(root, topology);
 		set_vol_topology(root, topology);
 		set_complexity_topology(root, topology);
-		stars = lappend(stars, star);
+		stars = lappend(stars, topology);
 	}
 	return stars;
 }
@@ -301,7 +305,7 @@ void update_indices(Topology *component)
 static double density(List *sub)
 {
 	int n = list_length(sub);
-	if (n < 2) {
+	if (n < 4) {
 		return 0.0;
 	}
 
@@ -338,42 +342,50 @@ List *find_dense_subgraphs(PlannerInfo *root, List *vertexes, bool *used)
 	List *dense_sets = NIL; // List* of Topology*
 
 	while (true) {
-		List *S = NIL;
+		List *candidate = NIL;
 		ListCell *lc;
 		foreach (lc, vertexes) {
 			Vertex *v = (Vertex *)lfirst(lc);
 			if (!used[v->index]) {
-				S = lappend(S, v);
+				candidate = lappend(candidate, v);
 			}
 		}
 
-		if (list_length(S) < 4) {
+		if (list_length(candidate) < 4) {
+			list_free(candidate);
 			break;
 		}
 
-		while (density(S) < THRESH && list_length(S) >= 4) {
-			Vertex *vmin = find_min_degree_vertex(S);
+		while (list_length(candidate) >= 4) {
+			double cur_density = density(candidate);
+			if (cur_density >= THRESH) {
+				break;
+			}
+
+			Vertex *vmin = find_min_degree_vertex(candidate);
 			if (vmin == NULL) {
 				break;
 			}
-			S = list_delete_ptr(S, vmin);
+
+			candidate = list_delete_ptr(candidate, vmin);
 		}
 
-		if (list_length(S) >= 4 && density(S) >= THRESH) {
-			Topology *topology = (Topology *)palloc0(sizeof(Topology));
-			topology->vertexes = S;
-			topology->topology = DENSITY_GRAPH;
-			set_sel_topology(root, topology);
-			set_vol_topology(root, topology);
-			set_complexity_topology(root, topology);
-			dense_sets = lappend(dense_sets, topology);
-
-			foreach (lc, S) {
-				Vertex *v = (Vertex *)lfirst(lc);
-				used[v->index] = true;
-			}
-		} else {
+		double final_density = density(candidate);
+		if (list_length(candidate) < 4 || final_density < THRESH) {
+			list_free(candidate);
 			break;
+		}
+		Topology *topology = (Topology *)palloc0(sizeof(Topology));
+		topology->vertexes = candidate;
+		topology->topology = DENSITY_GRAPH;
+		set_sel_topology(root, topology);
+		set_vol_topology(root, topology);
+		set_complexity_topology(root, topology);
+		dense_sets = lappend(dense_sets, topology);
+
+		foreach (lc, candidate) {
+			Vertex *v = (Vertex *)lfirst(lc);
+			used[v->index] = true;
 		}
 	}
 

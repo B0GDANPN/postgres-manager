@@ -1,15 +1,32 @@
 # .clangd
-Diagnostics:
-  Suppress:
-    - "-Wdeclaration-after-statement"
-    - clang-diagnostic-declaration-after-statement
-    - altera-unroll-loops
-    - readability-identifier-length
-    - eadability-identifier-length   # на случай опечатки в источнике
-    - cppcoreguidelines-init-variables
-    - cppcoreguidelines-avoid-magic-numbers   # алиас readability-magic-numbers
-    - readability-magic-numbers
-    - readability-function-cognitive-complexity
 
+
+---
+If:
+  PathMatch: .*/*
 CompileFlags:
-  Add: ["-Wno-declaration-after-statement"]
+  CompilationDatabase: ./
+  Remove: [
+  -Wclang-diagnostic-declaration-after-statement,
+      -Waltera-unroll-loops,
+      -Wreadability-identifier-length,
+      -Weadability-identifier-length,
+      -Wcppcoreguidelines-init-variables,
+      -Wbugprone-easily-swappable-parameters,
+      -Wcppcoreguidelines-avoid-magic-numbers,
+      -Wreadability-identifier-length,
+      -Wcppcoreguidelines-avoid-non-const-global-variables,
+      -Wmisc-no-recursion,
+      -Wmisc-unused-parameters,
+      -Wimplicit-function-declaration,
+      -Wgoogle-readability-braces-around-statements,
+      -Wunused-includes,
+      -Wreadability-magic-numbers,
+      -Wreadability-math-missing-parentheses,
+      -Wunused-const-variable,
+      -Wunused-function,
+      -Wdeclaration-after-statement,
+      -Wunused-function
+  ]
+Index:
+  Background: Build
