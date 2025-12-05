@@ -13,6 +13,8 @@
 #include "optimizer/paths.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
+#include <float.h>
+#include <optimizer/cost.h>
 
 static const uint64 dphyp_geqo_cc_threshold = 10000;
 static const double THRESH = 0.9;
@@ -20,13 +22,16 @@ static const uint64 border_chain = 1000;
 static const uint64 border_cycle = 1000;
 static const uint64 border_star = 1000;
 static const uint64 border_density_graph = 1000;
+static const Selectivity border_selectivity = 0.4;
+static const int max_ray_length = 3;
 
 static void set_complexity_topology(PlannerInfo *root, Topology *topology);
 static List *dfs_component(Vertex *v, List *comp, bool *used_vertexes);
-static List *dfs(Vertex *prev, Vertex *cur, List *stack, List *cycles, bool *visited,
+static List *dfs(PlannerInfo *root, Vertex *prev, Vertex *cur, List *stack, List *cycles,
+		 bool *visited,
 		 bool *used_vertexes_comp); // stack is list of Vertex*
 static bool is_star(Vertex *center, const bool *used_vertexes);
-static List *find_star(Vertex *center, bool *used_vertexes);
+static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes);
 static void print_graph(List *graph);
 static Vertex *find_min_degree_vertex(List *sub);
 static double density(List *sub);
@@ -126,8 +131,8 @@ List *split_components(PlannerInfo *root, List *vertexes)
 	return comps;
 }
 
-static List *dfs(Vertex *prev, Vertex *cur, List *stack, List *cycles, bool *visited,
-		 bool *used_vertexes_comp)
+static List *dfs(PlannerInfo *root, Vertex *prev, Vertex *cur, List *stack, List *cycles,
+		 bool *visited, bool *used_vertexes_comp)
 {
 	visited[cur->index] = true;
 	stack = lappend(stack, cur);
@@ -137,12 +142,22 @@ static List *dfs(Vertex *prev, Vertex *cur, List *stack, List *cycles, bool *vis
 		if (nbr == prev) {
 			continue;
 		}
+		Selectivity sel = get_selectivity(root, cur->rel, nbr->rel);
+		if (sel > border_selectivity) {
+			continue;
+		}
 		if (visited[nbr->index] && stack->length >= 3) {
-			ListCell *start = &list_make_ptr_cell(nbr);
 			List *cycle = NIL;
 			ListCell *lc2;
-			for_each_cell (lc2, stack, start) {
+			foreach (lc2, stack) {
 				Vertex *it = (Vertex *)lfirst(lc2);
+				if (it->index == nbr->index) {
+					break;
+				}
+			}
+			ListCell *lc3;
+			for_each_cell (lc3, stack, lc2) {
+				Vertex *it = (Vertex *)lfirst(lc3);
 				cycle = lappend(cycle, it);
 				used_vertexes_comp[it->index] = true;
 			}
@@ -150,7 +165,7 @@ static List *dfs(Vertex *prev, Vertex *cur, List *stack, List *cycles, bool *vis
 			break;
 		}
 		if (!visited[nbr->index] && !used_vertexes_comp[nbr->index]) {
-			cycles = dfs(cur, nbr, stack, cycles, visited, used_vertexes_comp);
+			cycles = dfs(root, cur, nbr, stack, cycles, visited, used_vertexes_comp);
 		}
 	}
 	visited[cur->index] = false;
@@ -171,7 +186,7 @@ List *find_cycles(PlannerInfo *root, List *vertexes, bool *used_vertexes_comp)
 			continue;
 		}
 		memset(visited, false, nverts_global * sizeof(bool));
-		cycles = dfs(NULL, v, stack, cycles, visited, used_vertexes_comp);
+		cycles = dfs(root, NULL, v, stack, cycles, visited, used_vertexes_comp);
 	}
 	List *cyclic_topologies = NIL;
 	foreach (lc, cycles) {
@@ -206,35 +221,47 @@ static bool is_star(Vertex *center, const bool *used_vertexes)
 	}
 	return count_unused_neighbors >= 3 || count_light_neighbors >= 2;
 }
-static List *find_star(Vertex *center, bool *used_vertexes)
+static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes)
 {
 	List *star = NIL;
 	star = lappend(star, center);
 	used_vertexes[center->index] = true;
 	ListCell *lc;
 	foreach (lc, center->adj) {
-		Vertex *neighbor = (Vertex *)lfirst(lc);
-		do {
-			if (used_vertexes[neighbor->index]) {
+		Vertex *prev = star;
+		int ray_len = 0;
+		Vertex *curr = (Vertex *)lfirst(lc);
+		while (ray_len < max_ray_length) {
+			if (used_vertexes[curr->index]) {
 				break;
 			}
-			star = lappend(star, neighbor);
-			used_vertexes[neighbor->index] = true;
-			if (is_star(neighbor, used_vertexes)) {
+			star = lappend(star, curr);
+			used_vertexes[curr->index] = true;
+			ray_len += 1;
+			if (is_star(curr, used_vertexes)) {
 				break;
 			}
-			if (neighbor->adj == NIL) {
+			if (curr->adj == NIL) {
 				break;
 			}
-			neighbor = (Vertex *)list_head(neighbor->adj);
-		} while (true);
+			Vertex *new_neighbor = (Vertex *)list_head(curr->adj);
+			if (new_neighbor == center) {
+				new_neighbor = lnext(curr->adj, list_head(curr->adj));
+			}
+			if (get_selectivity(root, curr->rel, new_curr->rel) > border_selectivity) {
+				break;
+			}
+			curr = new_neighbor;
+		}
+		while (true)
+			;
 	}
 	return star;
 }
 
 List *find_chains(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 {
-	List *remaining_chains = NIL; // List* of Topology*
+	List *chains = NIL; // List* of Topology*
 	ListCell *lc;
 	foreach (lc, vertexes) {
 		Vertex *v = (Vertex *)lfirst(lc);
@@ -247,10 +274,10 @@ List *find_chains(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 			set_sel_topology(root, topology);
 			set_vol_topology(root, topology);
 			set_complexity_topology(root, topology);
-			remaining_chains = lappend(remaining_chains, topology);
+			chains = lappend(chains, topology);
 		}
 	}
-	return remaining_chains;
+	return chains;
 }
 
 List *find_stars(PlannerInfo *root, List *vertexes, bool *used_vertexes)
@@ -262,7 +289,7 @@ List *find_stars(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 		if (used_vertexes[v->index] || !is_star(v, used_vertexes)) {
 			continue;
 		}
-		List *star = find_star(v, used_vertexes); // List* of Vertex*
+		List *star = find_star(root, v, used_vertexes); // List* of Vertex*
 		Topology *topology = (Topology *)palloc0(sizeof(Topology));
 		topology->vertexes = star;
 		topology->topology = STAR;
@@ -413,15 +440,15 @@ static void set_complexity_topology(PlannerInfo *root, Topology *topology)
 
 Selectivity get_selectivity(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 { // TODO join_is_legal
-	RelOptInfo *joinrel = { 0 };
-	joinrel->relids = bms_union(rel1->relids, rel2->relids);
+	RelOptInfo joinrel;
+	joinrel.relids = bms_union(rel1->relids, rel2->relids);
 	SpecialJoinInfo sjinfo;
 	init_dummy_sjinfo(&sjinfo, rel1->relids, rel2->relids);
-	joinrel->relids = add_outer_joins_to_relids(root, joinrel->relids, &sjinfo, NULL);
-	List *clauses = build_joinrel_restrictlist(root, joinrel, rel1, rel2, &sjinfo);
+	joinrel.relids = add_outer_joins_to_relids(root, joinrel.relids, &sjinfo, NULL);
+	List *clauses = build_joinrel_restrictlist(root, &joinrel, rel1, rel2, &sjinfo);
 
 	Selectivity result = clauselist_selectivity(root, clauses, 0, JOIN_INNER, &sjinfo);
-	bms_free(joinrel->relids);
+	bms_free(joinrel.relids);
 	return result;
 }
 
@@ -496,4 +523,16 @@ void set_sel_topology(PlannerInfo *root, Topology *topology)
 	list_free(clauses);
 	bms_free(relids_topology);
 	topology->sel = sel;
+}
+
+Cost cost_simple_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
+{
+	Cost min_cost = DBL_MAX;
+	JoinCostWorkspace workspace;
+	Path *outer_path = rel1->cheapest_total_path;
+	Path *inner_path = rel2->cheapest_total_path;
+	initial_cost_nestloop(root, &workspace, JOIN_INNER, outer_path, inner_path, NULL);
+	if (workspace.total_cost < min_cost) {
+		min_cost = workspace.total_cost;
+	}
 }

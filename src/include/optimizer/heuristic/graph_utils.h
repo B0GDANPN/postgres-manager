@@ -31,4 +31,5 @@ extern void update_indices(Topology *component);
 extern Selectivity get_selectivity(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2);
 extern void set_sel_topology(PlannerInfo *root, Topology *topology);
 extern void set_vol_topology(PlannerInfo *root, Topology *topology);
+extern Cost cost_simple_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2);
 #endif

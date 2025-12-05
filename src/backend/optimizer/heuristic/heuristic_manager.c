@@ -1,7 +1,6 @@
 #include "postgres.h"
 #include "c.h"
 #include "nodes/nodes.h"
-#include "nodes/bitmapset.h"
 #include "nodes/pathnodes.h"
 #include <limits.h>
 #include <float.h>
@@ -23,7 +22,7 @@ static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, int *cos
 
 static RelOptInfo *goo(PlannerInfo *root, List *component_plans, GooComp gooComp, bool clauseless);
 
-static void split_budget_among_topologies(List *topologies, int budget);
+static void split_budget_among_topologies(List *topologies, uint64 budget, ListCell *init_cell);
 static uint64 get_cost_heuristic(Topology *topology, TypeHeuristic type_heuristic);
 ///////////////////////////////////////////////////////////////////////////////////
 static uint64 get_cost_heuristic(Topology *topology, TypeHeuristic type_heuristic)
@@ -39,16 +38,16 @@ static uint64 get_cost_heuristic(Topology *topology, TypeHeuristic type_heuristi
 	}
 }
 
-static void split_budget_among_topologies(List *topologies, int budget)
+static void split_budget_among_topologies(List *topologies, uint64 budget, ListCell *init_cell)
 {
 	uint64 sum_complexities = 0;
 	ListCell *lc;
-	foreach (lc, topologies) {
+	for_each_cell (lc, topologies, init_cell) {
 		Topology *topology = (Topology *)lfirst(lc);
 		double k_sel = 1 / topology->sel;
 		sum_complexities += k1 * topology->ccp + k2 * k_sel;
 	}
-	foreach (lc, topologies) {
+	for_each_cell (lc, topologies, init_cell) {
 		Topology *topology = (Topology *)lfirst(lc);
 		topology->budget = topology->ccp * budget / sum_complexities;
 	}
@@ -58,15 +57,19 @@ RelOptInfo *heuristic_join_search(PlannerInfo *root, List *initial_rels, int bud
 {
 	List *graph = build_join_graph(root, initial_rels); // List* of Vertex*
 	List *components = split_components(root, graph);   // list of Topology(COMPONENT)*
-	split_budget_among_topologies(components, budget);
+	split_budget_among_topologies(components, budget, NULL);
 	List *component_plans = NIL;
 	ListCell *lc = NULL;
+	uint64 component_budget = 0;
 	foreach (lc, components) {
+		if (component_budget > 0) {
+			split_budget_among_topologies(components, budget, lc);
+		}
 		Topology *component = (Topology *)lfirst(lc);
 
 		List *comp_vertexes = component->vertexes; // List* of Vertex*
 
-		uint64 component_budget = component->budget;
+		component_budget = component->budget;
 		uint64 current_budget = component_budget * b1;
 		while (list_length(comp_vertexes) > 1) {
 			update_indices(component);
@@ -83,7 +86,7 @@ RelOptInfo *heuristic_join_search(PlannerInfo *root, List *initial_rels, int bud
 			topologies = list_concat(topologies, stars);
 			List *remaining_chains = find_chains(root, comp_vertexes, used_vertexes);
 			topologies = list_concat(topologies, remaining_chains);
-			split_budget_among_topologies(topologies, current_budget);
+			split_budget_among_topologies(topologies, current_budget, NULL);
 
 			List *topology_plans = NIL;
 			foreach (lc, topologies) {
@@ -159,7 +162,6 @@ static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, int *cos
 		RelOptInfo *rel = v->rel;
 		initial_rels = lappend(initial_rels, rel);
 	}
-	RelOptInfo *plan = NULL;
-	plan = (RelOptInfo *)linitial(initial_rels); // TODO(b-pyanzin):
+	RelOptInfo *plan = geqo(root, list_length(initial_rels), initial_rels);
 	return plan;
 }

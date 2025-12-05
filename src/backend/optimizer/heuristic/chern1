@@ -763,3 +763,204 @@ static RelOptInfo* plan_chain(PlannerInfo* root, int number_of_rels, List* initi
     return plan;
 }
 */
+
+
+
+static Cost get_join_cost(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
+{
+    Cost best_cost = DBL_MAX;
+	Relids	joinrelids = bms_union(rel1->relids, rel2->relids);
+	SpecialJoinInfo *sjinfo;
+	bool		reversed;
+	join_is_legal(root, rel1, rel2, joinrelids,
+					   &sjinfo, &reversed);
+	bool		isouterjoin = IS_OUTER_JOIN(sjinfo->jointype);
+	RelOptInfo* outer_rel = (reversed)? rel2 : rel1;
+	RelOptInfo* inner_rel = (reversed)? rel1 : rel1;
+	if (reversed)
+	{
+		RelOptInfo *trel = rel1;
+
+		rel1 = rel2;
+		rel2 = trel;
+	}
+	Path *outer_path = outer_rel->cheapest_total_path;
+	Path *inner_path = inner_rel->cheapest_total_path;
+
+	RelOptInfo* joinrel;
+	joinrel = makeNode(RelOptInfo);
+	joinrel->reloptkind = RELOPT_JOINREL;
+	joinrel->relids = bms_copy(joinrelids);
+	joinrel->rows = 0;
+	/* cheap startup cost is interesting iff not all tuples to be retrieved */
+	joinrel->consider_startup = (root->tuple_fraction > 0);
+	joinrel->consider_param_startup = false;
+	joinrel->consider_parallel = false;
+	joinrel->reltarget = create_empty_pathtarget();
+	joinrel->pathlist = NIL;
+	joinrel->ppilist = NIL;
+	joinrel->partial_pathlist = NIL;
+	joinrel->cheapest_startup_path = NULL;
+	joinrel->cheapest_total_path = NULL;
+	joinrel->cheapest_unique_path = NULL;
+	joinrel->cheapest_parameterized_paths = NIL;
+	/* init direct_lateral_relids from children; we'll finish it up below */
+	joinrel->direct_lateral_relids =
+		bms_union(outer_rel->direct_lateral_relids,
+				  inner_rel->direct_lateral_relids);
+	joinrel->lateral_relids = min_join_parameterization(root, joinrel->relids,
+														outer_rel, inner_rel);
+	joinrel->relid = 0;			/* indicates not a baserel */
+	joinrel->rtekind = RTE_JOIN;
+	joinrel->min_attr = 0;
+	joinrel->max_attr = 0;
+	joinrel->attr_needed = NULL;
+	joinrel->attr_widths = NULL;
+	joinrel->notnullattnums = NULL;
+	joinrel->nulling_relids = NULL;
+	joinrel->lateral_vars = NIL;
+	joinrel->lateral_referencers = NULL;
+	joinrel->indexlist = NIL;
+	joinrel->statlist = NIL;
+	joinrel->pages = 0;
+	joinrel->tuples = 0;
+	joinrel->allvisfrac = 0;
+	joinrel->eclass_indexes = NULL;
+	joinrel->subroot = NULL;
+	joinrel->subplan_params = NIL;
+	joinrel->rel_parallel_workers = -1;
+	joinrel->amflags = 0;
+	joinrel->serverid = InvalidOid;
+	joinrel->userid = InvalidOid;
+	joinrel->useridiscurrent = false;
+	joinrel->fdwroutine = NULL;
+	joinrel->fdw_private = NULL;
+	joinrel->unique_for_rels = NIL;
+	joinrel->non_unique_for_rels = NIL;
+	joinrel->baserestrictinfo = NIL;
+	joinrel->baserestrictcost.startup = 0;
+	joinrel->baserestrictcost.per_tuple = 0;
+	joinrel->baserestrict_min_security = UINT_MAX;
+	joinrel->joininfo = NIL;
+	joinrel->has_eclass_joins = false;
+	joinrel->consider_partitionwise_join = false;	/* might get changed later */
+	joinrel->parent = NULL;
+	joinrel->top_parent = NULL;
+	joinrel->top_parent_relids = NULL;
+	joinrel->part_scheme = NULL;
+	joinrel->nparts = -1;
+	joinrel->boundinfo = NULL;
+	joinrel->partbounds_merged = false;
+	joinrel->partition_qual = NIL;
+	joinrel->part_rels = NULL;
+	joinrel->live_parts = NULL;
+	joinrel->all_partrels = NULL;
+	joinrel->partexprs = NULL;
+	joinrel->nullable_partexprs = NULL;
+
+	/* Compute information relevant to the foreign relations. */
+	set_foreign_rel_properties(joinrel, outer_rel, inner_rel);
+
+	/*
+	 * Fill the joinrel's tlist with just the Vars and PHVs that need to be
+	 * output from this join (ie, are needed for higher joinclauses or final
+	 * output).
+	 *
+	 * NOTE: the tlist order for a join rel will depend on which pair of outer
+	 * and inner rels we first try to build it from.  But the contents should
+	 * be the same regardless.
+	 */
+	build_joinrel_tlist(root, joinrel, outer_rel, sjinfo, pushed_down_joins,
+						(sjinfo->jointype == JOIN_FULL));
+	build_joinrel_tlist(root, joinrel, inner_rel, sjinfo, pushed_down_joins,
+						(sjinfo->jointype != JOIN_INNER));
+	add_placeholders_to_joinrel(root, joinrel, outer_rel, inner_rel, sjinfo);
+
+	/*
+	 * add_placeholders_to_joinrel also took care of adding the ph_lateral
+	 * sets of any PlaceHolderVars computed here to direct_lateral_relids, so
+	 * now we can finish computing that.  This is much like the computation of
+	 * the transitively-closed lateral_relids in min_join_parameterization,
+	 * except that here we *do* have to consider the added PHVs.
+	 */
+	joinrel->direct_lateral_relids =
+		bms_del_members(joinrel->direct_lateral_relids, joinrel->relids);
+	List *restrictlist = build_joinrel_restrictlist(root,joinrel, outer_rel,inner_rel,sjinfo);
+	List *hashclauses  = NIL;
+	List *mergeclauses = NIL;
+	ListCell *lc;
+
+	foreach (lc, restrictlist)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+		/*
+		 * If processing an outer join, only use its own join clauses for
+		 * hashing.  For inner joins we need not be so picky.
+		 */
+		if (isouterjoin && RINFO_IS_PUSHED_DOWN(restrictinfo, joinrel->relids))
+			continue;
+
+		if (!restrictinfo->can_join ||
+			restrictinfo->hashjoinoperator == InvalidOid)
+			continue;			/* not hashjoinable */
+
+		/*
+		 * Check if clause has the form "outer op inner" or "inner op outer".
+		 */
+		if (!clause_sides_match_join(restrictinfo, outerrel->relids,
+									 innerrel->relids))
+			continue;			/* no good for these input relations */
+
+		/*
+		 * If clause has the form "inner op outer", check if its operator has
+		 * valid commutator.  This is necessary because hashclauses in this
+		 * form will get commuted in createplan.c to put the outer var on the
+		 * left (see get_switched_clauses).  This probably shouldn't ever
+		 * fail, since hashable operators ought to have commutators, but be
+		 * paranoid.
+		 *
+		 * The clause being hashjoinable indicates that it's an OpExpr.
+		 */
+		if (!restrictinfo->outer_is_left &&
+			!OidIsValid(get_commutator(castNode(OpExpr, restrictinfo->clause)->opno)))
+			continue;
+		hashclauses  = lappend(hashclauses,  rinfo);
+		if (mergejoinable(rinfo))
+			mergeclauses = lappend(mergeclauses, rinfo);
+	}
+
+	/* JoinPathExtraData заполняем минимумом */
+	JoinPathExtraData extra;
+	MemSet(&extra, 0, sizeof(extra));
+	extra.restrictlist = restrictlist;
+	extra.jointype     = JOIN_INNER;
+
+	JoinCostWorkspace workspace;
+
+	/* ---------- Nested Loop ---------- */
+	initial_cost_nestloop(root, &workspace, JOIN_INNER,
+							outer_path, inner_path, &extra);
+	if (workspace.total_cost < best_cost)
+		best_cost = workspace.total_cost;
+
+	/* ---------- Hash Join ------------ */
+	initial_cost_hashjoin(root, &workspace, JOIN_INNER,
+							hashclauses,
+							outer_path, inner_path,
+							&extra,
+							false);          /* parallel_hash */
+	if (workspace.total_cost < best_cost)
+		best_cost = workspace.total_cost;
+
+	/* ---------- Merge Join ----------- */
+	initial_cost_mergejoin(root, &workspace, JOIN_INNER,
+							mergeclauses,
+							outer_path, inner_path,
+							NIL, NIL,          /* sortkeys (ещё не считаем) */
+							0,                 /* outer_presorted_keys */
+							&extra);
+	if (workspace.total_cost < best_cost)
+		best_cost = workspace.total_cost;
+	bms_free(joinrelids);
+    return best_cost;
+}
