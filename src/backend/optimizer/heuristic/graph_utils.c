@@ -15,6 +15,8 @@
 #include "optimizer/pathnode.h"
 #include <float.h>
 #include <optimizer/cost.h>
+#include "optimizer/restrictinfo.h"
+#include "utils/lsyscache.h"
 
 static const uint64 dphyp_geqo_cc_threshold = 10000;
 static const double THRESH = 0.9;
@@ -32,7 +34,7 @@ static List *dfs(PlannerInfo *root, Vertex *prev, Vertex *cur, List *stack, List
 		 bool *used_vertexes_comp); // stack is list of Vertex*
 static bool is_star(Vertex *center, const bool *used_vertexes);
 static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes);
-static void print_graph(List *graph);
+static void print_graph(PlannerInfo *root, List *graph);
 static Vertex *find_min_degree_vertex(List *sub);
 static double density(List *sub);
 static int count_edges(List *sub);
@@ -72,25 +74,29 @@ List *build_join_graph(PlannerInfo *root, List *initial_rels)
 			}
 		}
 	}
-	print_graph(vertexes);
+	print_graph(root, vertexes);
 	return vertexes;
 }
-static void print_graph(List *graph)
+static void print_graph(PlannerInfo *root, List *graph)
 {
+	StringInfoData buf;
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "\n----------------------\n");
 	ListCell *lc;
 	foreach (lc, graph) {
 		Vertex *vertex = (Vertex *)lfirst(lc);
-		StringInfoData buf;
-		initStringInfo(&buf);
-		appendStringInfo(&buf, "%zu :", vertex->index);
+		Cost cost_rel = vertex->rel->cheapest_total_path->total_cost;
+		appendStringInfo(&buf, "%zu(%lf):", vertex->index, cost_rel);
 		ListCell *lc2;
 		foreach (lc2, vertex->adj) {
 			Vertex *neighbor = (Vertex *)lfirst(lc2);
-			appendStringInfo(&buf, " %zu", neighbor->index);
+			Cost cost_edge = cost_simple_edge(root, vertex->rel, neighbor->rel);
+			appendStringInfo(&buf, " %zu(%lf)", neighbor->index, cost_edge);
 		}
-		ereport(NOTICE, (errmsg("%s\n", buf.data)));
-		pfree(buf.data);
+		appendStringInfo(&buf, "\n");
 	}
+	ereport(NOTICE, (errmsg("%s\n", buf.data)));
+	pfree(buf.data);
 }
 
 static List *dfs_component(Vertex *v, List *comp, bool *used_vertexes)
@@ -120,7 +126,7 @@ List *split_components(PlannerInfo *root, List *vertexes)
 			List *sub = NIL;
 			sub = dfs_component(v, sub, used_vertexes);
 			component->vertexes = sub;
-			component->topology = COMPONENT;
+			component->form = COMPONENT;
 			set_sel_topology(root, component);
 			set_vol_topology(root, component);
 			set_complexity_topology(root, component);
@@ -193,7 +199,7 @@ List *find_cycles(PlannerInfo *root, List *vertexes, bool *used_vertexes_comp)
 		List *cycle = (List *)lfirst(lc);
 		Topology *topology = (Topology *)palloc0(sizeof(Topology));
 		topology->vertexes = cycle;
-		topology->topology = CYCLE;
+		topology->form = CYCLE;
 		set_sel_topology(root, topology);
 		set_vol_topology(root, topology);
 		set_complexity_topology(root, topology);
@@ -228,33 +234,31 @@ static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes)
 	used_vertexes[center->index] = true;
 	ListCell *lc;
 	foreach (lc, center->adj) {
-		Vertex *prev = star;
 		int ray_len = 0;
 		Vertex *curr = (Vertex *)lfirst(lc);
 		while (ray_len < max_ray_length) {
-			if (used_vertexes[curr->index]) {
-				break;
-			}
 			star = lappend(star, curr);
 			used_vertexes[curr->index] = true;
 			ray_len += 1;
-			if (is_star(curr, used_vertexes)) {
-				break;
+			Vertex *new_neighbor = NULL;
+			Selectivity sel = border_selectivity;
+			ListCell *lc2;
+			foreach (lc2, curr->adj) {
+				Vertex *tmp = (Vertex *)lfirst(lc2);
+				if (used_vertexes[tmp->index] || is_star(tmp, used_vertexes)) {
+					continue;
+				}
+				Selectivity tmp_sel = get_selectivity(root, curr->rel, tmp->rel);
+				if (tmp_sel < sel) {
+					new_neighbor = tmp;
+					sel = tmp_sel;
+				}
 			}
-			if (curr->adj == NIL) {
-				break;
-			}
-			Vertex *new_neighbor = (Vertex *)list_head(curr->adj);
-			if (new_neighbor == center) {
-				new_neighbor = lnext(curr->adj, list_head(curr->adj));
-			}
-			if (get_selectivity(root, curr->rel, new_curr->rel) > border_selectivity) {
+			if (new_neighbor == NULL) {
 				break;
 			}
 			curr = new_neighbor;
 		}
-		while (true)
-			;
 	}
 	return star;
 }
@@ -270,7 +274,7 @@ List *find_chains(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 			sub = dfs_component(v, sub, used_vertexes);
 			Topology *topology = (Topology *)palloc0(sizeof(Topology));
 			topology->vertexes = sub;
-			topology->topology = CHAIN;
+			topology->form = CHAIN;
 			set_sel_topology(root, topology);
 			set_vol_topology(root, topology);
 			set_complexity_topology(root, topology);
@@ -292,7 +296,7 @@ List *find_stars(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 		List *star = find_star(root, v, used_vertexes); // List* of Vertex*
 		Topology *topology = (Topology *)palloc0(sizeof(Topology));
 		topology->vertexes = star;
-		topology->topology = STAR;
+		topology->form = STAR;
 		set_sel_topology(root, topology);
 		set_vol_topology(root, topology);
 		set_complexity_topology(root, topology);
@@ -404,7 +408,7 @@ List *find_dense_subgraphs(PlannerInfo *root, List *vertexes, bool *used)
 		}
 		Topology *topology = (Topology *)palloc0(sizeof(Topology));
 		topology->vertexes = candidate;
-		topology->topology = DENSITY_GRAPH;
+		topology->form = DENSITY_GRAPH;
 		set_sel_topology(root, topology);
 		set_vol_topology(root, topology);
 		set_complexity_topology(root, topology);
@@ -528,11 +532,108 @@ void set_sel_topology(PlannerInfo *root, Topology *topology)
 Cost cost_simple_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 {
 	Cost min_cost = DBL_MAX;
-	JoinCostWorkspace workspace;
-	Path *outer_path = rel1->cheapest_total_path;
-	Path *inner_path = rel2->cheapest_total_path;
-	initial_cost_nestloop(root, &workspace, JOIN_INNER, outer_path, inner_path, NULL);
-	if (workspace.total_cost < min_cost) {
-		min_cost = workspace.total_cost;
+	JoinPathExtraData extra;
+	RelOptInfo *outer_rels[2] = { rel1, rel2 };
+	RelOptInfo *inner_rels[2] = { rel2, rel1 };
+	for (int i = 0; i < 2; i++) {
+		RelOptInfo *outer_rel = outer_rels[i];
+		RelOptInfo *inner_rel = inner_rels[i];
+		Path *outer_path = outer_rel->cheapest_total_path;
+		Path *inner_path = inner_rel->cheapest_total_path;
+		JoinCostWorkspace workspace;
+		List *hashclauses = NIL;
+		List *mergeclauses = NIL;
+		SpecialJoinInfo sjinfo;
+		RelOptInfo joinrel;
+		List *restrictlist;
+		ListCell *lc;
+
+		if (PATH_PARAM_BY_REL(outer_path, inner_rel) ||
+		    PATH_PARAM_BY_REL(inner_path, outer_rel)) {
+			continue;
+		}
+
+		joinrel.relids = bms_union(outer_rel->relids, inner_rel->relids);
+		init_dummy_sjinfo(&sjinfo, outer_rel->relids, inner_rel->relids);
+		joinrel.relids = add_outer_joins_to_relids(root, joinrel.relids, &sjinfo, NULL);
+		restrictlist =
+			build_joinrel_restrictlist(root, &joinrel, outer_rel, inner_rel, &sjinfo);
+
+		memset(&extra, 0, sizeof(JoinPathExtraData));
+		extra.restrictlist = restrictlist;
+		extra.mergeclause_list = NIL;
+		extra.inner_unique = false;
+		extra.sjinfo = &sjinfo;
+		extra.param_source_rels = joinrel.relids;
+
+		initial_cost_nestloop(root, &workspace, JOIN_INNER, outer_path, inner_path, &extra);
+		if (workspace.total_cost < min_cost) {
+			min_cost = workspace.total_cost;
+		}
+
+		foreach (lc, restrictlist) {
+			RestrictInfo *restrictinfo = (RestrictInfo *)lfirst(lc);
+
+			if (!restrictinfo->can_join ||
+			    restrictinfo->hashjoinoperator == InvalidOid) {
+				continue;
+			}
+
+			if (!clause_sides_match_join(restrictinfo,
+						     outer_rel->relids,
+						     inner_rel->relids)) {
+				continue;
+			}
+
+			if (!restrictinfo->outer_is_left &&
+			    !OidIsValid(
+				    get_commutator(castNode(OpExpr, restrictinfo->clause)->opno))) {
+				continue;
+			}
+
+			hashclauses = lappend(hashclauses, restrictinfo);
+		}
+
+		if (hashclauses != NIL) {
+			initial_cost_hashjoin(root,
+					      &workspace,
+					      JOIN_INNER,
+					      hashclauses,
+					      outer_path,
+					      inner_path,
+					      &extra,
+					      false);
+			if (workspace.total_cost < min_cost) {
+				min_cost = workspace.total_cost;
+			}
+		}
+
+		mergeclauses = find_mergeclauses_for_outer_pathkeys(root,
+								    outer_path->pathkeys,
+								    restrictlist);
+
+		if (mergeclauses != NIL) {
+			List *outersortkeys = outer_path->pathkeys;
+			List *innersortkeys =
+				make_inner_pathkeys_for_merge(root, mergeclauses, outersortkeys);
+
+			initial_cost_mergejoin(root,
+					       &workspace,
+					       JOIN_INNER,
+					       mergeclauses,
+					       outer_path,
+					       inner_path,
+					       outersortkeys,
+					       innersortkeys,
+					       0,
+					       &extra);
+			if (workspace.total_cost < min_cost) {
+				min_cost = workspace.total_cost;
+			}
+		}
+
+		bms_free(joinrel.relids);
 	}
+
+	return min_cost;
 }

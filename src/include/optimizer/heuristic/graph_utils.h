@@ -15,7 +15,7 @@ typedef struct Topology {
 	List *vertexes;
 	uint64 ccp;
 	uint64 budget;
-	TypeTopology topology;
+	TypeTopology form;
 	Selectivity sel;
 	Cardinality vol;
 } Topology;

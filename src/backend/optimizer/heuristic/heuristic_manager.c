@@ -4,6 +4,8 @@
 #include "nodes/pathnodes.h"
 #include <limits.h>
 #include <float.h>
+#include <stdbool.h>
+#include <string.h>
 #include "optimizer/pathnode.h"
 #include "optimizer/heuristic/heuristic_manager.h"
 #include "optimizer/heuristic/graph_utils.h"
@@ -16,11 +18,9 @@ static double k1 = 0.5;
 static double k2 = 0.5;
 typedef enum { STANDARD, GOO, GEQO } TypeHeuristic;
 
-typedef enum GooComp { VOLUME, COST } GooComp;
+static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, Cost *cost_plan);
 
-static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, int *cost_plan);
-
-static RelOptInfo *goo(PlannerInfo *root, List *component_plans, GooComp gooComp, bool clauseless);
+static RelOptInfo *goo(PlannerInfo *root, List *component_plans, bool clauseless);
 
 static void split_budget_among_topologies(List *topologies, uint64 budget, ListCell *init_cell);
 static uint64 get_cost_heuristic(Topology *topology, TypeHeuristic type_heuristic);
@@ -91,14 +91,14 @@ RelOptInfo *heuristic_join_search(PlannerInfo *root, List *initial_rels, int bud
 			List *topology_plans = NIL;
 			foreach (lc, topologies) {
 				Topology *topology = (Topology *)lfirst(lc);
-				int cost_plan = 0;
+				Cost cost_plan = 0;
 				RelOptInfo *plan = plan_subgraph(root, topology, &cost_plan);
 				topology_plans = lappend(topology_plans, plan);
 				current_budget -= cost_plan;
 			}
 			component_budget += current_budget; // maybe remain budget
 			current_budget = component_budget * q;
-			list_free_deep(comp_vertexes);
+			list_free(comp_vertexes);
 			comp_vertexes = build_join_graph(root, topology_plans);
 			pfree(used_vertexes);
 		}
@@ -106,27 +106,21 @@ RelOptInfo *heuristic_join_search(PlannerInfo *root, List *initial_rels, int bud
 		RelOptInfo *comp_plan = v->rel;
 		component_plans = lappend(component_plans, comp_plan);
 	}
-	RelOptInfo *final_plan = goo(root, component_plans, VOLUME, true);
-	list_free_deep(graph);
+	RelOptInfo *final_plan = goo(root, component_plans, true);
+	list_free(graph);
 	return final_plan;
 }
 
-static RelOptInfo *goo(PlannerInfo *root, List *initial_rels, GooComp gooComp, bool clauseless)
+static RelOptInfo *goo(PlannerInfo *root, List *initial_rels, bool clauseless)
 {
-	List *rels; // List of RelOptInfo* as set c++
-	ListCell *lc;
-	foreach (lc, initial_rels) {
-		RelOptInfo *plan = (RelOptInfo *)lfirst(lc);
-		rels = lappend(rels, plan);
-	}
-	while (list_length(rels) > 1) {
+	while (list_length(initial_rels) > 1) {
 		RelOptInfo *parent1 = NULL, *parent2 = NULL;
 		Selectivity best_sel = 1;
 		Cost best_cost = DBL_MAX;
 		ListCell *i, *j;
 
-		foreach (i, rels) {
-			foreach (j, rels) {
+		foreach (i, initial_rels) {
+			foreach (j, initial_rels) {
 				if (i == j) {
 					continue;
 				}
@@ -145,16 +139,17 @@ static RelOptInfo *goo(PlannerInfo *root, List *initial_rels, GooComp gooComp, b
 		}
 		RelOptInfo *best_rel = make_join_rel(root, parent1, parent2);
 		set_cheapest(best_rel);
-		rels = lappend(rels, best_rel);
-		rels = list_delete_cell(rels, parent1);
-		rels = list_delete_cell(rels, parent2);
+		initial_rels = lappend(initial_rels, best_rel);
+		initial_rels = list_delete_cell(initial_rels, parent1);
+		initial_rels = list_delete_cell(initial_rels, parent2);
 	}
 
-	RelOptInfo *plan = (RelOptInfo *)linitial(rels);
+	RelOptInfo *plan = (RelOptInfo *)linitial(initial_rels);
 	return plan;
 }
-static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, int *cost_plan)
+static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 {
+	// cost_plan -- final cost plannitg this topology
 	List *initial_rels = NIL; // List* of RelOptInfo*
 	ListCell *lc;
 	foreach (lc, topology->vertexes) {
@@ -162,6 +157,37 @@ static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, int *cos
 		RelOptInfo *rel = v->rel;
 		initial_rels = lappend(initial_rels, rel);
 	}
-	RelOptInfo *plan = geqo(root, list_length(initial_rels), initial_rels);
+
+	RelOptInfo *plan = NULL;
+	plan = standard_join_search(root,
+				    list_length(initial_rels),
+				    initial_rels,
+				    topology->budget,
+				    cost_plan);
+	if (plan) {
+		return plan;
+	}
+	// fail planning DP, very expensive, so try cheaper.
+	*cost_plan = 0;
+	switch (topology->form) {
+	case CHAIN:
+		plan = plan_chain(root, topology, cost_plan);
+	case CYCLE:
+		plan = plan_cycle(root, topology, cost_plan);
+	case STAR:
+		plan = plan_star(root, topology, cost_plan);
+	case DENSITY_GRAPH:
+		plan = plan_density(root, topology, cost_plan);
+	case COMPONENT:
+		plan = NULL;
+	}
+	if (plan) {
+		return plan;
+	}
+	// specialized heuristis very expensive, so GOO.
+	*cost_plan = 0;
+	plan = goo(root, initial_rels, false, cost_plan);
+
+	// RelOptInfo *plan = geqo(root, list_length(initial_rels), initial_rels);
 	return plan;
 }
