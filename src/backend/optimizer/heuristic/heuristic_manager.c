@@ -1,4 +1,5 @@
 #include "postgres.h"
+#include "nodes/pg_list.h"
 #include "c.h"
 #include "nodes/nodes.h"
 #include "nodes/pathnodes.h"
@@ -17,26 +18,13 @@ static double q = 1 / 4;
 static double k1 = 0.5;
 static double k2 = 0.5;
 typedef enum { STANDARD, GOO, GEQO } TypeHeuristic;
-
+static List *choose_min_cost_cover(List *partial_plans);
 static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, Cost *cost_plan);
 
 static RelOptInfo *goo(PlannerInfo *root, List *component_plans, bool clauseless);
 
 static void split_budget_among_topologies(List *topologies, uint64 budget, ListCell *init_cell);
-static uint64 get_cost_heuristic(Topology *topology, TypeHeuristic type_heuristic);
 ///////////////////////////////////////////////////////////////////////////////////
-static uint64 get_cost_heuristic(Topology *topology, TypeHeuristic type_heuristic)
-{
-	return 0;
-	if (topology->topology == CHAIN) {
-	}
-	if (topology->topology == CYCLE) {
-	}
-	if (topology->topology == STAR) {
-	}
-	if (topology->topology == DENSITY_GRAPH) {
-	}
-}
 
 static void split_budget_among_topologies(List *topologies, uint64 budget, ListCell *init_cell)
 {
@@ -147,10 +135,74 @@ static RelOptInfo *goo(PlannerInfo *root, List *initial_rels, bool clauseless)
 	RelOptInfo *plan = (RelOptInfo *)linitial(initial_rels);
 	return plan;
 }
+
+/*
+ * choose_min_cost_cover
+ *
+ * Greedy set cover that selects the cheapest combination of partial plans
+ * whose relids together cover all relids present in the input list. The
+ * heuristic prefers plans with the lowest cost per newly covered rel and, in
+ * case of ties, the cheapest plan overall.
+ */
+static List *choose_min_cost_cover(List *partial_plans)
+{
+	Bitmapset *uncovered = NULL;
+	ListCell *lc;
+
+	foreach (lc, partial_plans) {
+		RelOptInfo *rel = (RelOptInfo *)lfirst(lc);
+		uncovered = bms_add_members(uncovered, rel->relids);
+	}
+
+	List *coverage = NIL;
+	List *remaining = list_copy(partial_plans);
+
+	while (!bms_is_empty(uncovered)) {
+		RelOptInfo *best_rel = NULL;
+		ListCell *best_cell = NULL;
+		double best_score = DBL_MAX;
+		Cost best_cost = DBL_MAX;
+
+		foreach (lc, remaining) {
+			RelOptInfo *candidate = (RelOptInfo *)lfirst(lc);
+			Bitmapset *newly = bms_intersect(uncovered, candidate->relids);
+			int newly_covered = bms_num_members(newly);
+			bms_free(newly);
+			if (newly_covered == 0) {
+				continue;
+			}
+
+			Cost cost = candidate->cheapest_total_path->total_cost;
+			double score = cost / (double)newly_covered;
+
+			if (score < best_score || (score == best_score && cost < best_cost)) {
+				best_score = score;
+				best_cost = cost;
+				best_rel = candidate;
+				best_cell = lc;
+			}
+		}
+
+		if (best_rel == NULL) {
+			break;
+		}
+
+		coverage = lappend(coverage, best_rel);
+		uncovered = bms_del_members(uncovered, best_rel->relids);
+		remaining = list_delete_cell(remaining, best_cell);
+	}
+
+	bms_free(uncovered);
+	list_free(remaining);
+
+	return coverage;
+}
+
 static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 {
 	// cost_plan -- final cost plannitg this topology
 	List *initial_rels = NIL; // List* of RelOptInfo*
+	RelOptInfo *plan = NULL;
 	ListCell *lc;
 	foreach (lc, topology->vertexes) {
 		Vertex *v = (Vertex *)lfirst(lc);
@@ -158,36 +210,49 @@ static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, Cost *co
 		initial_rels = lappend(initial_rels, rel);
 	}
 
-	RelOptInfo *plan = NULL;
-	plan = standard_join_search(root,
-				    list_length(initial_rels),
-				    initial_rels,
-				    topology->budget,
-				    cost_plan);
-	if (plan) {
+	List *partial_plans = NIL;
+	Cost cost_tmp_plan = 0;
+	partial_plans = standard_join_search(root,
+					     list_length(initial_rels),
+					     initial_rels,
+					     topology->budget,
+					     cost_tmp_plan);
+
+	topology->budget -= cost_tmp_plan;
+	*cost_plan += cost_tmp_plan;
+	cost_tmp_plan = 0;
+	if (list_length(partial_plans) == 1) {
+		plan = (RelOptInfo *)linitial(partial_plans);
 		return plan;
 	}
+
 	// fail planning DP, very expensive, so try cheaper.
-	*cost_plan = 0;
+	initial_rels = choose_min_cost_cover(partial_plans);
 	switch (topology->form) {
 	case CHAIN:
-		plan = plan_chain(root, topology, cost_plan);
+		partial_plans = plan_chain(root, topology, cost_tmp_plan);
 	case CYCLE:
-		plan = plan_cycle(root, topology, cost_plan);
+		partial_plans = plan_cycle(root, topology, cost_tmp_plan);
 	case STAR:
-		plan = plan_star(root, topology, cost_plan);
+		partial_plans = plan_star(root, topology, cost_tmp_plan);
 	case DENSITY_GRAPH:
-		plan = plan_density(root, topology, cost_plan);
+		partial_plans = plan_density(root, topology, cost_tmp_plan);
 	case COMPONENT:
-		plan = NULL;
+		partial_plans = NIL;
 	}
-	if (plan) {
+	topology->budget -= cost_tmp_plan;
+	*cost_plan += cost_tmp_plan;
+	cost_tmp_plan = 0;
+	if (list_length(partial_plans) == 1) {
+		plan = (RelOptInfo *)linitial(partial_plans);
 		return plan;
 	}
 	// specialized heuristis very expensive, so GOO.
-	*cost_plan = 0;
-	plan = goo(root, initial_rels, false, cost_plan);
-
+	initial_rels = choose_min_cost_cover(partial_plans);
+	plan = goo(root, initial_rels, false, cost_tmp_plan);
+	topology->budget -= cost_tmp_plan;
+	*cost_plan += cost_tmp_plan;
+	cost_tmp_plan = 0;
 	// RelOptInfo *plan = geqo(root, list_length(initial_rels), initial_rels);
 	return plan;
 }

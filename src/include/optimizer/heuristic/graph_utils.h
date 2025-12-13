@@ -14,7 +14,7 @@ typedef enum { CHAIN, CYCLE, STAR, DENSITY_GRAPH, COMPONENT } TypeTopology;
 typedef struct Topology {
 	List *vertexes;
 	uint64 ccp;
-	uint64 budget;
+	Cost budget;
 	TypeTopology form;
 	Selectivity sel;
 	Cardinality vol;

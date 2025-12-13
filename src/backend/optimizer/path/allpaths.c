@@ -13,6 +13,7 @@
  *-------------------------------------------------------------------------
  */
 
+#include "nodes/pg_list.h"
 #include "optimizer/heuristic/heuristic_manager.h"
 #include "postgres.h"
 
@@ -3324,6 +3325,7 @@ static RelOptInfo *make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		 */
 		root->initial_rels = initial_rels;
 		return heuristic_join_search(root, initial_rels, levels_needed * 100);
+		/*
 		if (join_search_hook) {
 			return (*join_search_hook)(root, levels_needed, initial_rels);
 		} else if (enable_geqo && levels_needed >= geqo_threshold) {
@@ -3331,6 +3333,7 @@ static RelOptInfo *make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		} else {
 			return standard_join_search(root, levels_needed, initial_rels);
 		}
+		*/
 	}
 }
 
@@ -3363,7 +3366,8 @@ static RelOptInfo *make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
  * than one join-order search, you'll probably need to save and restore the
  * original states of those data structures.  See geqo_eval() for an example.
  */
-RelOptInfo *standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
+List *standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels, Cost budget,
+			   Cost *cost)
 {
 	int lev;
 	RelOptInfo *rel;
@@ -3397,7 +3401,7 @@ RelOptInfo *standard_join_search(PlannerInfo *root, int levels_needed, List *ini
 		 * level, and build paths for making each one from every available
 		 * pair of lower-level relations.
 		 */
-		join_search_one_level(root, lev);
+		bool done = join_search_one_level(root, lev, budget, cost);
 
 		/*
 		 * Run generate_partitionwise_join_paths() and
@@ -3432,6 +3436,11 @@ RelOptInfo *standard_join_search(PlannerInfo *root, int levels_needed, List *ini
 			pprint(rel);
 #endif
 		}
+		if (!done) {
+			List *partial_plans = root->join_rel_level[lev - 1];
+			partial_plans = list_concat(partial_plans, root->join_rel_level[lev - 1]);
+			return partial_plans;
+		}
 	}
 
 	/*
@@ -3443,10 +3452,10 @@ RelOptInfo *standard_join_search(PlannerInfo *root, int levels_needed, List *ini
 	Assert(list_length(root->join_rel_level[levels_needed]) == 1);
 
 	rel = (RelOptInfo *)linitial(root->join_rel_level[levels_needed]);
-
+	List *result = list_make1(rel);
 	root->join_rel_level = NULL;
 
-	return rel;
+	return result;
 }
 
 /*****************************************************************************
