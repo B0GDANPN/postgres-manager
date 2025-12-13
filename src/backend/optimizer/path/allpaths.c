@@ -13,8 +13,8 @@
  *-------------------------------------------------------------------------
  */
 
-#include "nodes/pg_list.h"
 #include "optimizer/heuristic/heuristic_manager.h"
+#include "nodes/pg_list.h"
 #include "postgres.h"
 
 #include <limits.h>
