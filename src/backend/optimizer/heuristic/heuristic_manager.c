@@ -22,7 +22,7 @@ static List *choose_min_cost_cover(List *partial_plans);
 static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, Cost *cost_plan);
 
 static RelOptInfo *goo(PlannerInfo *root, List *component_plans, bool clauseless);
-
+static List *plan_chain_dp(PlannerInfo *root, Topology *topology, Cost *cost_plan);
 static void split_budget_among_topologies(List *topologies, uint64 budget, ListCell *init_cell);
 ///////////////////////////////////////////////////////////////////////////////////
 
@@ -201,22 +201,36 @@ static List *choose_min_cost_cover(List *partial_plans)
 static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 {
 	// cost_plan -- final cost plannitg this topology
-	List *initial_rels = NIL; // List* of RelOptInfo*
 	RelOptInfo *plan = NULL;
-	ListCell *lc;
-	foreach (lc, topology->vertexes) {
-		Vertex *v = (Vertex *)lfirst(lc);
-		RelOptInfo *rel = v->rel;
-		initial_rels = lappend(initial_rels, rel);
-	}
-
 	List *partial_plans = NIL;
 	Cost cost_tmp_plan = 0;
+	switch (topology->form) {
+	case CHAIN:
+		partial_plans = plan_chain_dp(root, topology, &cost_tmp_plan);
+	case CYCLE:
+		partial_plans = plan_cycle(root, topology, &cost_tmp_plan);
+	case STAR:
+		partial_plans = plan_star(root, topology, &cost_tmp_plan);
+	case DENSITY_GRAPH:
+	case COMPONENT:
+		break;
+	}
+	topology->budget -= cost_tmp_plan;
+	*cost_plan += cost_tmp_plan;
+	cost_tmp_plan = 0;
+	if (list_length(partial_plans) == 1) {
+		plan = (RelOptInfo *)linitial(partial_plans);
+		return plan;
+	}
+
+	//  fail planning DP, very expensive, so try cheaper.
+	List *initial_rels = choose_min_cost_cover(partial_plans);
+
 	partial_plans = standard_join_search(root,
 					     list_length(initial_rels),
 					     initial_rels,
 					     topology->budget,
-					     cost_tmp_plan);
+					     &cost_tmp_plan);
 
 	topology->budget -= cost_tmp_plan;
 	*cost_plan += cost_tmp_plan;
@@ -226,27 +240,6 @@ static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, Cost *co
 		return plan;
 	}
 
-	// fail planning DP, very expensive, so try cheaper.
-	initial_rels = choose_min_cost_cover(partial_plans);
-	switch (topology->form) {
-	case CHAIN:
-		partial_plans = plan_chain(root, topology, cost_tmp_plan);
-	case CYCLE:
-		partial_plans = plan_cycle(root, topology, cost_tmp_plan);
-	case STAR:
-		partial_plans = plan_star(root, topology, cost_tmp_plan);
-	case DENSITY_GRAPH:
-		partial_plans = plan_density(root, topology, cost_tmp_plan);
-	case COMPONENT:
-		partial_plans = NIL;
-	}
-	topology->budget -= cost_tmp_plan;
-	*cost_plan += cost_tmp_plan;
-	cost_tmp_plan = 0;
-	if (list_length(partial_plans) == 1) {
-		plan = (RelOptInfo *)linitial(partial_plans);
-		return plan;
-	}
 	// specialized heuristis very expensive, so GOO.
 	initial_rels = choose_min_cost_cover(partial_plans);
 	plan = goo(root, initial_rels, false, cost_tmp_plan);
@@ -255,4 +248,87 @@ static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, Cost *co
 	cost_tmp_plan = 0;
 	// RelOptInfo *plan = geqo(root, list_length(initial_rels), initial_rels);
 	return plan;
+}
+
+static List *plan_chain_dp(PlannerInfo *root, Topology *topology, Cost *cost_plan)
+{
+	int n = list_length(topology->vertexes);
+	int i, j, k;
+	if (n == 0) {
+		*cost_plan = 0;
+		return NIL;
+	}
+
+	RelOptInfo ***dp = (RelOptInfo ***)palloc0(n * sizeof(RelOptInfo **));
+	for (i = 0; i < n; i++) {
+		dp[i] = (RelOptInfo **)palloc0(n * sizeof(RelOptInfo *));
+	}
+
+	for (i = 0; i < n; i++) {
+		for (j = 0; j < n; j++) {
+			if (i == j) {
+				Vertex *v_i = (Vertex *)list_nth_cell(topology->vertexes, i);
+				dp[i][i] = v_i->rel;
+				continue;
+			}
+			dp[i][j] = NULL;
+		}
+	}
+
+	for (int len = 2; len <= n; len++) {
+		for (int i = 0; i <= n - len; i++) {
+			j = i + len - 1;
+
+			for (k = i; k < j; k++) {
+				if (dp[i][k] == NULL || dp[k + 1][j] == NULL) {
+					continue;
+				}
+				Cost prel_join_cost =
+					cost_simple_edge(root, dp[i][k], dp[k + 1][j]);
+				if (*cost_plan + prel_join_cost > topology->budget) {
+					break;
+				}
+				RelOptInfo *join = make_join_rel(root, dp[i][k], dp[k + 1][j]);
+				if (join == NULL) {
+					continue;
+				}
+				set_cheapest(join);
+				if (join->cheapest_total_path == NULL) {
+					continue;
+				}
+
+				Cost join_cost = join->cheapest_total_path->total_cost;
+				*cost_plan += join_cost;
+				if (join_cost < dp[i][j]->cheapest_total_path->total_cost) {
+					dp[i][j] = join;
+				}
+			}
+		}
+	}
+
+	RelOptInfo *full_plan = dp[0][n - 1];
+	if (full_plan != NULL &&
+	    dp[0][n - 1]->cheapest_total_path->total_cost <= topology->budget) {
+		*cost_plan = dp[0][n - 1]->cheapest_total_path->total_cost;
+		return list_make1(full_plan);
+	}
+
+	List *plans = NIL;
+	for (i = 0; i < n; i++) {
+		Cost best_cost = DBL_MAX;
+		int best_j = i;
+
+		for (j = i; j < n; j++) {
+			if (dp[i][j] != NULL &&
+			    dp[i][j]->cheapest_total_path->total_cost < best_cost) {
+				best_cost = dp[i][j]->cheapest_total_path->total_cost;
+				best_j = j;
+			}
+		}
+
+		plans = lappend(plans, dp[i][best_j]);
+		i = best_j;
+	}
+
+	return plans;
 }
