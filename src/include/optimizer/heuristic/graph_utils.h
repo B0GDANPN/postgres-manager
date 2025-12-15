@@ -18,6 +18,7 @@ typedef struct Topology {
 	TypeTopology form;
 	Selectivity sel;
 	Cardinality vol;
+	void *extended_info;
 } Topology;
 
 extern bool has_simple_inner_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2);

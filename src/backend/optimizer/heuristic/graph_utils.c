@@ -33,7 +33,7 @@ static List *dfs(PlannerInfo *root, Vertex *prev, Vertex *cur, List *stack, List
 		 bool *visited,
 		 bool *used_vertexes_comp); // stack is list of Vertex*
 static bool is_star(Vertex *center, const bool *used_vertexes);
-static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes);
+static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes, List *chains);
 static void print_graph(PlannerInfo *root, List *graph);
 static Vertex *find_min_degree_vertex(List *sub);
 static double density(List *sub);
@@ -227,17 +227,18 @@ static bool is_star(Vertex *center, const bool *used_vertexes)
 	}
 	return count_unused_neighbors >= 3 || count_light_neighbors >= 2;
 }
-static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes)
+static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes, List *chains)
 {
 	List *star = NIL;
 	star = lappend(star, center);
 	used_vertexes[center->index] = true;
-	ListCell *lc;
+	ListCell *lc = NULL;
 	foreach (lc, center->adj) {
 		int ray_len = 0;
 		Vertex *curr = (Vertex *)lfirst(lc);
+		List *chain = NIL;
 		while (ray_len < max_ray_length) {
-			star = lappend(star, curr);
+			chain = lappend(chain, curr);
 			used_vertexes[curr->index] = true;
 			ray_len += 1;
 			Vertex *new_neighbor = NULL;
@@ -259,6 +260,8 @@ static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes)
 			}
 			curr = new_neighbor;
 		}
+		star = list_concat(star, chain);
+		chains = lappend(chains, chain);
 	}
 	return star;
 }
@@ -293,10 +296,16 @@ List *find_stars(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 		if (used_vertexes[v->index] || !is_star(v, used_vertexes)) {
 			continue;
 		}
-		List *star = find_star(root, v, used_vertexes); // List* of Vertex*
+		List *chains = NIL;
+		List *star = find_star(root,
+				       v,
+				       used_vertexes,
+				       chains); // List* of {star_vertex, List1 of chain
+						// vertex, List_n of chain vertex}
 		Topology *topology = (Topology *)palloc0(sizeof(Topology));
-		topology->vertexes = star;
+		topology->vertexes = star; // TODO
 		topology->form = STAR;
+		topology->extended_info = chains;
 		set_sel_topology(root, topology);
 		set_vol_topology(root, topology);
 		set_complexity_topology(root, topology);

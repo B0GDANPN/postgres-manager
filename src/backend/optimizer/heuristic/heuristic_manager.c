@@ -23,6 +23,7 @@ static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, Cost *co
 
 static RelOptInfo *goo(PlannerInfo *root, List *component_plans, bool clauseless);
 static List *plan_chain_dp(PlannerInfo *root, Topology *topology, Cost *cost_plan);
+static List *plan_cycle(PlannerInfo *root, Topology *topology, Cost *cost_plan);
 static void split_budget_among_topologies(List *topologies, uint64 budget, ListCell *init_cell);
 ///////////////////////////////////////////////////////////////////////////////////
 
@@ -48,7 +49,7 @@ RelOptInfo *heuristic_join_search(PlannerInfo *root, List *initial_rels, int bud
 	split_budget_among_topologies(components, budget, NULL);
 	List *component_plans = NIL;
 	ListCell *lc = NULL;
-	uint64 component_budget = 0;
+	Cost component_budget = 0;
 	foreach (lc, components) {
 		if (component_budget > 0) {
 			split_budget_among_topologies(components, budget, lc);
@@ -58,7 +59,7 @@ RelOptInfo *heuristic_join_search(PlannerInfo *root, List *initial_rels, int bud
 		List *comp_vertexes = component->vertexes; // List* of Vertex*
 
 		component_budget = component->budget;
-		uint64 current_budget = component_budget * b1;
+		Cost current_budget = component_budget * b1;
 		while (list_length(comp_vertexes) > 1) {
 			update_indices(component);
 			bool *used_vertexes =
@@ -331,4 +332,63 @@ static List *plan_chain_dp(PlannerInfo *root, Topology *topology, Cost *cost_pla
 	}
 
 	return plans;
+}
+static List *plan_cycle(PlannerInfo *root, Topology *topology, Cost *cost_plan)
+{
+	int n = list_length(topology->vertexes);
+	int i;
+
+	if (n == 0) {
+		*cost_plan = 0;
+		return NIL;
+	}
+	Vertex **vertexes = (Vertex **)palloc(n * sizeof(Vertex *));
+	ListCell *lc;
+	i = 0;
+	foreach (lc, topology->vertexes) {
+		Vertex *v = (Vertex *)lfirst(lc);
+		vertexes[i++] = v;
+	}
+
+	double max_card = -1;
+	int removed_idx = 0;
+	for (i = 0; i < n; i++) {
+		int nxt = (i + 1) % n;
+		Selectivity sel = get_selectivity(root, vertexes[i]->rel, vertexes[nxt]->rel);
+		double card = sel * vertexes[i]->rel->rows * vertexes[nxt]->rel->rows;
+
+		if (card > max_card) {
+			max_card = card;
+			removed_idx = nxt;
+		}
+	}
+	List *chain_vertexes = NIL;
+	for (i = 1; i < n; i++) {
+		int idx = (removed_idx + i) % n;
+		chain_vertexes = lappend(chain_vertexes, vertexes[idx]);
+	}
+	Topology *chain_topology = (Topology *)palloc0(sizeof(Topology));
+	chain_topology->vertexes = chain_vertexes;
+	chain_topology->budget = topology->budget;
+	chain_topology->form = CHAIN;
+	List *chain_plans = plan_chain_dp(root, chain_topology, cost_plan);
+	if (list_length(chain_plans) == 1) {
+		RelOptInfo *chain_plan = (RelOptInfo *)linitial(chain_plans);
+		RelOptInfo *removed_rel = vertexes[removed_idx]->rel;
+		Cost tmp = cost_simple_edge(root, chain_plan, removed_rel);
+		if (*cost_plan + tmp <= topology->budget) {
+			RelOptInfo *join = make_join_rel(root, chain_plan, removed_rel);
+			if (join != NULL) {
+				set_cheapest(join);
+				if (join->cheapest_total_path != NULL) {
+					Cost join_cost = join->cheapest_total_path->total_cost;
+					if (*cost_plan + join_cost <= topology->budget) {
+						*cost_plan += join_cost;
+						return list_make1(join);
+					}
+				}
+			}
+		}
+	}
+	return lappend(chain_plans, vertexes[removed_idx]->rel);
 }
