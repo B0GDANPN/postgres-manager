@@ -12,7 +12,6 @@
 #include "optimizer/heuristic/graph_utils.h"
 #include "optimizer/paths.h"
 #include "optimizer/optimizer.h"
-#include "optimizer/geqo.h"
 static double b1 = 3 / 4;
 static double q = 1 / 4;
 static double k1 = 0.5;
@@ -24,6 +23,8 @@ static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, Cost *co
 static RelOptInfo *goo(PlannerInfo *root, List *component_plans, bool clauseless);
 static List *plan_chain_dp(PlannerInfo *root, Topology *topology, Cost *cost_plan);
 static List *plan_cycle(PlannerInfo *root, Topology *topology, Cost *cost_plan);
+static List *plan_star(PlannerInfo *root, Topology *topology, Cost *cost_plan);
+static List *plan_star2(PlannerInfo *root, Topology *topology, Cost *cost_plan);
 static void split_budget_among_topologies(List *topologies, uint64 budget, ListCell *init_cell);
 ///////////////////////////////////////////////////////////////////////////////////
 
@@ -214,7 +215,7 @@ static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, Cost *co
 		partial_plans = plan_star(root, topology, &cost_tmp_plan);
 	case DENSITY_GRAPH:
 	case COMPONENT:
-		break;
+		partial_plans = plan_dp_sub(root, topology, &cost_tmp_plan);
 	}
 	topology->budget -= cost_tmp_plan;
 	*cost_plan += cost_tmp_plan;
@@ -391,4 +392,137 @@ static List *plan_cycle(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 		}
 	}
 	return lappend(chain_plans, vertexes[removed_idx]->rel);
+}
+
+static List *plan_star(PlannerInfo *root, Topology *topology, Cost *cost_plan)
+{
+	Vertex *center_vertex = (Vertex *)linitial(topology->vertexes);
+	RelOptInfo *center_rel = center_vertex->rel;
+	List *rays = (List *)topology->extended_info; /* List* of List* of Vertex* */
+	int *ind_array = palloc0(list_length(rays) * sizeof(int));
+	bool was_join = false;
+	do {
+		Cardinality min_card = DBL_MAX;
+		int best_ind_ray = -1;
+		ListCell *ray = NULL;
+		foreach (ray, rays) {
+			List *ray_vertices = (List *)lfirst(ray); /* List* of Vertex* */
+			int ind_ray = list_cell_number(rays, ray);
+			int ind_head_ray = ind_array[ind_ray];
+			if (list_length(ray_vertices) == ind_head_ray) {
+				continue;
+			}
+			Vertex *head_vertex = (Vertex *)list_nth_cell(ray_vertices, ind_head_ray);
+			Selectivity sel = get_selectivity(root, center_rel, head_vertex->rel);
+			Cardinality card = sel * center_rel->rows * head_vertex->rel->rows;
+			if (card < min_card) {
+				min_card = card;
+				best_ind_ray = ind_ray;
+			}
+		}
+		if (best_ind_ray != -1) {
+			List *best_ray = (List *)list_nth_cell(rays, best_ind_ray);
+			Vertex *v_rel = (Vertex *)list_nth_cell(best_ray, ind_array[best_ind_ray]);
+			RelOptInfo *rel = v_rel->rel;
+			Cost prel_join_cost = cost_simple_edge(root, center_rel, rel);
+			if (*cost_plan + prel_join_cost <= topology->budget) {
+				was_join = true;
+				RelOptInfo *new_center = make_join_rel(root, center_rel, rel);
+				set_cheapest(new_center);
+				ind_array[best_ind_ray]++;
+				Cost join_cost = new_center->cheapest_total_path->total_cost;
+				*cost_plan += join_cost;
+				center_rel = new_center;
+			}
+		}
+	} while (was_join);
+	List *partials = list_make1(center_rel);
+	ListCell *ray = NULL;
+	foreach (ray, rays) {
+		List *ray_vertices = (List *)lfirst(ray); /* List* of Vertex* */
+		int ind_ray = list_cell_number(rays, ray);
+		int ind_head_ray = ind_array[ind_ray];
+		if (list_length(ray_vertices) == ind_head_ray) {
+			continue;
+		}
+		ListCell *init_cell = list_nth_cell(ray_vertices, ind_head_ray);
+		ListCell *lc = NULL;
+		for_each_cell (lc, ray_vertices, init_cell) {
+			Vertex *v = (Vertex *)lfirst(lc);
+			partials = lappend(partials, v->rel);
+		}
+	}
+	return partials;
+}
+
+static List *plan_star2(PlannerInfo *root, Topology *topology, Cost *cost_plan)
+{
+	Vertex *center_vertex = (Vertex *)linitial(topology->vertexes);
+	RelOptInfo *center_rel = center_vertex->rel;
+	List *rays = (List *)topology->extended_info; /* List* of List* of Vertex* */
+	List *partials = NIL;
+	List *chains_plans = NIL;
+	/* Plan each ray as an independent chain. */
+	ListCell *lc;
+	foreach (lc, rays) {
+		List *ray_vertices = (List *)lfirst(lc); /* List* of Vertex* */
+		Topology chain_topology;
+		List *chain_plans = NIL;
+		chain_topology.vertexes = ray_vertices;
+		chain_topology.form = CHAIN;
+		chain_topology.budget = topology->budget;
+		chain_plans = plan_chain_dp(root, &chain_topology, cost_plan);
+		if (list_length(chain_plans) > 1) {
+			partials = lappend(partials, center_rel);
+			partials = list_concat(partials, chain_plans);
+			ListCell *lc2;
+			for_each_cell (lc2, rays, lnext(rays, lc)) {
+				List *ray_vertices2 = (List *)lfirst(lc2);
+				ListCell *lc3;
+				foreach (lc3, ray_vertices2) {
+					RelOptInfo *rel = (RelOptInfo *)lfirst(lc3);
+					partials = lappend(partials, rel);
+				}
+			}
+			return partials;
+		}
+		RelOptInfo *chain_plan = (RelOptInfo *)linitial(chain_plans);
+		chains_plans = lappend(chains_plans, chain_plan);
+	}
+
+	/* Greedily join rays by the cheapest edge to the current center. */
+	while (chains_plans != NIL) {
+		RelOptInfo *best_rel = NULL;
+		ListCell *best_cell = NULL;
+		Cost best_edge_cost = DBL_MAX;
+
+		foreach (lc, chains_plans) {
+			RelOptInfo *rel = (RelOptInfo *)lfirst(lc);
+			Cost edge_cost = cost_simple_edge(root, center_rel, rel);
+
+			if (edge_cost < best_edge_cost) {
+				best_edge_cost = edge_cost;
+				best_rel = rel;
+				best_cell = lc;
+			}
+		}
+
+		if (*cost_plan + best_edge_cost > topology->budget) {
+			partials = lappend(partials, center_rel);
+
+			foreach (lc, chains_plans) {
+				RelOptInfo *rel = (RelOptInfo *)lfirst(lc);
+				partials = lappend(partials, rel);
+			}
+			return partials;
+		}
+
+		RelOptInfo *join = make_join_rel(root, center_rel, best_rel);
+		set_cheapest(join);
+		Cost join_cost = join->cheapest_total_path->total_cost;
+		*cost_plan += join_cost;
+		center_rel = join;
+		chains_plans = list_delete_cell(partials, best_cell);
+	}
+	return list_make1(center_rel);
 }
