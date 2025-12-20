@@ -20,25 +20,20 @@
 
 static const uint64 dphyp_geqo_cc_threshold = 10000;
 static const double THRESH = 0.9;
-static const uint64 border_chain = 1000;
-static const uint64 border_cycle = 1000;
-static const uint64 border_star = 1000;
-static const uint64 border_density_graph = 1000;
 static const Selectivity border_selectivity = 0.4;
 static const int max_ray_length = 3;
 
 static void set_complexity_topology(PlannerInfo *root, Topology *topology);
 static List *dfs_component(Vertex *v, List *comp, bool *used_vertexes);
-static List *dfs(PlannerInfo *root, Vertex *prev, Vertex *cur, List *stack, List *cycles,
-		 bool *visited,
-		 bool *used_vertexes_comp); // stack is list of Vertex*
+static List *dfs_cycle(PlannerInfo *root, Vertex *prev, Vertex *cur, List *stack, List *cycles,
+		       bool *visited,
+		       bool *used_vertexes_comp); // stack is list of Vertex*
 static bool is_star(Vertex *center, const bool *used_vertexes);
 static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes, List *chains);
 static void print_graph(PlannerInfo *root, List *graph);
 static Vertex *find_min_degree_vertex(List *sub);
 static double density(List *sub);
 static int count_edges(List *sub);
-////////////////////////////////////
 
 bool has_simple_inner_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 {
@@ -48,12 +43,11 @@ bool has_simple_inner_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2
 	bool result = !a && (b || c);
 	return result;
 }
-
 List *build_join_graph(PlannerInfo *root, List *initial_rels)
 {
 	List *vertexes = NIL;
 	size_t index = 0;
-	ListCell *lc;
+	ListCell *lc = NULL;
 	foreach (lc, initial_rels) {
 		RelOptInfo *rel = (RelOptInfo *)lfirst(lc);
 		Vertex *v = (Vertex *)palloc0(sizeof(Vertex));
@@ -82,12 +76,12 @@ static void print_graph(PlannerInfo *root, List *graph)
 	StringInfoData buf;
 	initStringInfo(&buf);
 	appendStringInfo(&buf, "\n----------------------\n");
-	ListCell *lc;
+	ListCell *lc = NULL;
 	foreach (lc, graph) {
 		Vertex *vertex = (Vertex *)lfirst(lc);
 		Cost cost_rel = vertex->rel->cheapest_total_path->total_cost;
 		appendStringInfo(&buf, "%zu(%lf):", vertex->index, cost_rel);
-		ListCell *lc2;
+		ListCell *lc2 = NULL;
 		foreach (lc2, vertex->adj) {
 			Vertex *neighbor = (Vertex *)lfirst(lc2);
 			Cost cost_edge = cost_simple_edge(root, vertex->rel, neighbor->rel);
@@ -103,7 +97,7 @@ static List *dfs_component(Vertex *v, List *comp, bool *used_vertexes)
 {
 	used_vertexes[v->index] = true;
 	comp = lappend(comp, v);
-	ListCell *lc;
+	ListCell *lc = NULL;
 	foreach (lc, v->adj) {
 		Vertex *next = (Vertex *)lfirst(lc);
 		if (!used_vertexes[next->index]) {
@@ -112,13 +106,23 @@ static List *dfs_component(Vertex *v, List *comp, bool *used_vertexes)
 	}
 	return comp;
 }
-
+void dfs_check(List *vertexes, Vertex *v, bool *used_vertexes)
+{
+	used_vertexes[v->index] = true;
+	ListCell *lc = NULL;
+	foreach (lc, v->adj) {
+		Vertex *next = (Vertex *)lfirst(lc);
+		if (!used_vertexes[next->index]) {
+			dfs_check(vertexes, next, used_vertexes);
+		}
+	}
+}
 List *split_components(PlannerInfo *root, List *vertexes)
 {
 	List *comps = NIL; // List* of Component*
 	int number_of_rels = list_length(vertexes);
 	bool *used_vertexes = (bool *)palloc0(number_of_rels * sizeof(bool));
-	ListCell *lc;
+	ListCell *lc = NULL;
 	foreach (lc, vertexes) {
 		Vertex *v = (Vertex *)lfirst(lc);
 		if (!used_vertexes[v->index]) {
@@ -137,12 +141,12 @@ List *split_components(PlannerInfo *root, List *vertexes)
 	return comps;
 }
 
-static List *dfs(PlannerInfo *root, Vertex *prev, Vertex *cur, List *stack, List *cycles,
-		 bool *visited, bool *used_vertexes_comp)
+static List *dfs_cycle(PlannerInfo *root, Vertex *prev, Vertex *cur, List *stack, List *cycles,
+		       bool *visited, bool *used_vertexes_comp)
 {
 	visited[cur->index] = true;
 	stack = lappend(stack, cur);
-	ListCell *lc;
+	ListCell *lc = NULL;
 	foreach (lc, cur->adj) {
 		Vertex *nbr = (Vertex *)lfirst(lc);
 		if (nbr == prev) {
@@ -154,14 +158,14 @@ static List *dfs(PlannerInfo *root, Vertex *prev, Vertex *cur, List *stack, List
 		}
 		if (visited[nbr->index] && stack->length >= 3) {
 			List *cycle = NIL;
-			ListCell *lc2;
+			ListCell *lc2 = NULL;
 			foreach (lc2, stack) {
 				Vertex *it = (Vertex *)lfirst(lc2);
 				if (it->index == nbr->index) {
 					break;
 				}
 			}
-			ListCell *lc3;
+			ListCell *lc3 = NULL;
 			for_each_cell (lc3, stack, lc2) {
 				Vertex *it = (Vertex *)lfirst(lc3);
 				cycle = lappend(cycle, it);
@@ -171,7 +175,13 @@ static List *dfs(PlannerInfo *root, Vertex *prev, Vertex *cur, List *stack, List
 			break;
 		}
 		if (!visited[nbr->index] && !used_vertexes_comp[nbr->index]) {
-			cycles = dfs(root, cur, nbr, stack, cycles, visited, used_vertexes_comp);
+			cycles = dfs_cycle(root,
+					   cur,
+					   nbr,
+					   stack,
+					   cycles,
+					   visited,
+					   used_vertexes_comp);
 		}
 	}
 	visited[cur->index] = false;
@@ -185,14 +195,14 @@ List *find_cycles(PlannerInfo *root, List *vertexes, bool *used_vertexes_comp)
 	List *cycles = NIL; // List* of List* of Vertex*
 	bool *visited = (bool *)palloc0(nverts_global * sizeof(bool));
 	List *stack = NIL;
-	ListCell *lc;
+	ListCell *lc = NULL;
 	foreach (lc, vertexes) {
 		Vertex *v = (Vertex *)lfirst(lc);
 		if (used_vertexes_comp[v->index]) {
 			continue;
 		}
-		memset(visited, false, nverts_global * sizeof(bool));
-		cycles = dfs(root, NULL, v, stack, cycles, visited, used_vertexes_comp);
+		MemSet(visited, false, nverts_global * sizeof(bool));
+		cycles = dfs_cycle(root, NULL, v, stack, cycles, visited, used_vertexes_comp);
 	}
 	List *cyclic_topologies = NIL;
 	foreach (lc, cycles) {
@@ -214,7 +224,7 @@ static bool is_star(Vertex *center, const bool *used_vertexes)
 	int count_unused_neighbors = 0;
 	int count_light_neighbors = 0;
 	double volume_center = center->rel->rows;
-	ListCell *lc;
+	ListCell *lc = NULL;
 	foreach (lc, center->adj) {
 		Vertex *neighbor = (Vertex *)lfirst(lc);
 		if (!used_vertexes[neighbor->index]) {
@@ -243,7 +253,7 @@ static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes, L
 			ray_len += 1;
 			Vertex *new_neighbor = NULL;
 			Selectivity sel = border_selectivity;
-			ListCell *lc2;
+			ListCell *lc2 = NULL;
 			foreach (lc2, curr->adj) {
 				Vertex *tmp = (Vertex *)lfirst(lc2);
 				if (used_vertexes[tmp->index] || is_star(tmp, used_vertexes)) {
@@ -269,7 +279,7 @@ static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes, L
 List *find_chains(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 {
 	List *chains = NIL; // List* of Topology*
-	ListCell *lc;
+	ListCell *lc = NULL;
 	foreach (lc, vertexes) {
 		Vertex *v = (Vertex *)lfirst(lc);
 		if (!used_vertexes[v->index]) {
@@ -290,7 +300,7 @@ List *find_chains(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 List *find_stars(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 {
 	List *stars = NIL;
-	ListCell *lc;
+	ListCell *lc = NULL;
 	foreach (lc, vertexes) {
 		Vertex *v = (Vertex *)lfirst(lc);
 		if (used_vertexes[v->index] || !is_star(v, used_vertexes)) {
@@ -568,7 +578,7 @@ Cost cost_simple_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 		restrictlist =
 			build_joinrel_restrictlist(root, &joinrel, outer_rel, inner_rel, &sjinfo);
 
-		memset(&extra, 0, sizeof(JoinPathExtraData));
+		MemSet(&extra, 0, sizeof(JoinPathExtraData));
 		extra.restrictlist = restrictlist;
 		extra.mergeclause_list = NIL;
 		extra.inner_unique = false;

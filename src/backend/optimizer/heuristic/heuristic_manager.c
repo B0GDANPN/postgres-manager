@@ -1,41 +1,41 @@
-#include "postgres.h"
-#include "nodes/pg_list.h"
+#include "optimizer/heuristic/heuristic_manager.h"
 #include "c.h"
+#include "common/fe_memutils.h"
+#include "nodes/bitmapset.h"
 #include "nodes/nodes.h"
 #include "nodes/pathnodes.h"
-#include <limits.h>
+#include "nodes/pg_list.h"
+#include "optimizer/heuristic/graph_utils.h"
+#include "optimizer/pathnode.h"
+#include "optimizer/paths.h"
+#include "port/pg_bitutils.h"
+#include "postgres.h"
 #include <float.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <string.h>
-#include "optimizer/pathnode.h"
-#include "optimizer/heuristic/heuristic_manager.h"
-#include "optimizer/heuristic/graph_utils.h"
-#include "optimizer/paths.h"
-#include "optimizer/optimizer.h"
-static double b1 = 3 / 4;
-static double q = 1 / 4;
-static double k1 = 0.5;
-static double k2 = 0.5;
+static const double b1 = 0.75;
+static const double q = 0.25;
+static const double budget_soft_limit = 0.9;
+static const double k1 = 0.5;
+static const double k2 = 0.5;
 typedef enum { STANDARD, GOO, GEQO } TypeHeuristic;
 static List *choose_min_cost_cover(List *partial_plans);
 static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, Cost *cost_plan);
 
-static RelOptInfo *goo(PlannerInfo *root, List *component_plans, bool clauseless);
+static RelOptInfo *goo(PlannerInfo *root, List *initial_rels, bool clauseless, Cost *cost_plan);
 static List *plan_chain_dp(PlannerInfo *root, Topology *topology, Cost *cost_plan);
 static List *plan_cycle(PlannerInfo *root, Topology *topology, Cost *cost_plan);
 static List *plan_star(PlannerInfo *root, Topology *topology, Cost *cost_plan);
 static List *plan_star2(PlannerInfo *root, Topology *topology, Cost *cost_plan);
 static List *plan_dp_sub(PlannerInfo *root, Topology *topology, Cost *cost_plan);
-static bool bitmaps_adjacent(Vertex **vertexes, int n, uint64 left_bm, uint64 right_bm);
-static bool bitmap_connected(Vertex **vertexes, int n, uint64 bitmap, bool *visited, int *queue);
-static int bitmap_popcount64(uint64 bitmap);
+static bool bitmap_connected(List *top_vertexes, uint64 bitmap);
 static void split_budget_among_topologies(List *topologies, uint64 budget, ListCell *init_cell);
-///////////////////////////////////////////////////////////////////////////////////
 
 static void split_budget_among_topologies(List *topologies, uint64 budget, ListCell *init_cell)
 {
-	uint64 sum_complexities = 0;
-	ListCell *lc;
+	Cost sum_complexities = 0;
+	ListCell *lc = NULL;
 	for_each_cell (lc, topologies, init_cell) {
 		Topology *topology = (Topology *)lfirst(lc);
 		double k_sel = 1 / topology->sel;
@@ -100,42 +100,43 @@ RelOptInfo *heuristic_join_search(PlannerInfo *root, List *initial_rels, int bud
 		RelOptInfo *comp_plan = v->rel;
 		component_plans = lappend(component_plans, comp_plan);
 	}
-	RelOptInfo *final_plan = goo(root, component_plans, true);
+	RelOptInfo *final_plan = goo(root, component_plans, true, NULL);
 	list_free(graph);
 	return final_plan;
 }
 
-static RelOptInfo *goo(PlannerInfo *root, List *initial_rels, bool clauseless)
+static RelOptInfo *goo(PlannerInfo *root, List *initial_rels, bool clauseless, Cost *cost_plan)
 {
 	while (list_length(initial_rels) > 1) {
-		RelOptInfo *parent1 = NULL, *parent2 = NULL;
-		Selectivity best_sel = 1;
+		ListCell *best_lc1 = NULL;
+		ListCell *best_lc2 = NULL;
 		Cost best_cost = DBL_MAX;
-		ListCell *i, *j;
+		ListCell *i = NULL;
+		ListCell *j = NULL;
 
 		foreach (i, initial_rels) {
-			foreach (j, initial_rels) {
-				if (i == j) {
+			for_each_cell (j, initial_rels, lnext(initial_rels, i)) {
+				RelOptInfo *rel1 = (RelOptInfo *)lfirst(i);
+				RelOptInfo *rel2 = (RelOptInfo *)lfirst(j);
+				if (!clauseless && !has_simple_inner_edge(root, rel1, rel2)) {
 					continue;
 				}
-				RelOptInfo *r_i = (RelOptInfo *)lfirst(i);
-				RelOptInfo *r_j = (RelOptInfo *)lfirst(j);
-				if (!clauseless && !has_simple_inner_edge(root, r_i, r_j)) {
-					continue;
-				}
-				Selectivity tmp_sel = get_selectivity(root, r_i, r_j);
-				if (tmp_sel < best_sel) {
-					best_sel = tmp_sel;
-					parent1 = r_i;
-					parent2 = r_j;
+				Cost prel_join_cost = cost_simple_edge(root, rel1, rel2);
+				if (prel_join_cost < best_cost) {
+					best_cost = prel_join_cost;
+					best_lc1 = i;
+					best_lc2 = j;
 				}
 			}
 		}
-		RelOptInfo *best_rel = make_join_rel(root, parent1, parent2);
+		RelOptInfo *best_rel1 = (RelOptInfo *)lfirst(best_lc1);
+		RelOptInfo *best_rel2 = (RelOptInfo *)lfirst(best_lc2);
+		RelOptInfo *best_rel = make_join_rel(root, best_rel1, best_rel2);
 		set_cheapest(best_rel);
+		*cost_plan += best_rel->cheapest_total_path->total_cost;
 		initial_rels = lappend(initial_rels, best_rel);
-		initial_rels = list_delete_cell(initial_rels, parent1);
-		initial_rels = list_delete_cell(initial_rels, parent2);
+		initial_rels = list_delete_cell(initial_rels, best_lc1);
+		initial_rels = list_delete_cell(initial_rels, best_lc2);
 	}
 
 	RelOptInfo *plan = (RelOptInfo *)linitial(initial_rels);
@@ -153,7 +154,7 @@ static RelOptInfo *goo(PlannerInfo *root, List *initial_rels, bool clauseless)
 static List *choose_min_cost_cover(List *partial_plans)
 {
 	Bitmapset *uncovered = NULL;
-	ListCell *lc;
+	ListCell *lc = NULL;
 
 	foreach (lc, partial_plans) {
 		RelOptInfo *rel = (RelOptInfo *)lfirst(lc);
@@ -248,11 +249,9 @@ static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, Cost *co
 
 	// specialized heuristis very expensive, so GOO.
 	initial_rels = choose_min_cost_cover(partial_plans);
-	plan = goo(root, initial_rels, false, cost_tmp_plan);
+	plan = goo(root, initial_rels, false, cost_plan);
 	topology->budget -= cost_tmp_plan;
 	*cost_plan += cost_tmp_plan;
-	cost_tmp_plan = 0;
-	// RelOptInfo *plan = geqo(root, list_length(initial_rels), initial_rels);
 	return plan;
 }
 
@@ -280,7 +279,7 @@ static List *plan_chain_dp(PlannerInfo *root, Topology *topology, Cost *cost_pla
 			dp[i][j] = NULL;
 		}
 	}
-
+	bool success = true;
 	for (int len = 2; len <= n; len++) {
 		for (int i = 0; i <= n - len; i++) {
 			j = i + len - 1;
@@ -291,7 +290,9 @@ static List *plan_chain_dp(PlannerInfo *root, Topology *topology, Cost *cost_pla
 				}
 				Cost prel_join_cost =
 					cost_simple_edge(root, dp[i][k], dp[k + 1][j]);
-				if (*cost_plan + prel_join_cost > topology->budget) {
+				if (*cost_plan + prel_join_cost >
+				    topology->budget * budget_soft_limit) {
+					success = false;
 					break;
 				}
 				RelOptInfo *join = make_join_rel(root, dp[i][k], dp[k + 1][j]);
@@ -311,11 +312,8 @@ static List *plan_chain_dp(PlannerInfo *root, Topology *topology, Cost *cost_pla
 			}
 		}
 	}
-
-	RelOptInfo *full_plan = dp[0][n - 1];
-	if (full_plan != NULL &&
-	    dp[0][n - 1]->cheapest_total_path->total_cost <= topology->budget) {
-		*cost_plan = dp[0][n - 1]->cheapest_total_path->total_cost;
+	if (success && dp[0][n - 1] != NULL) {
+		RelOptInfo *full_plan = dp[0][n - 1];
 		return list_make1(full_plan);
 	}
 
@@ -348,7 +346,7 @@ static List *plan_cycle(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 		return NIL;
 	}
 	Vertex **vertexes = (Vertex **)palloc(n * sizeof(Vertex *));
-	ListCell *lc;
+	ListCell *lc = NULL;
 	i = 0;
 	foreach (lc, topology->vertexes) {
 		Vertex *v = (Vertex *)lfirst(lc);
@@ -381,13 +379,14 @@ static List *plan_cycle(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 		RelOptInfo *chain_plan = (RelOptInfo *)linitial(chain_plans);
 		RelOptInfo *removed_rel = vertexes[removed_idx]->rel;
 		Cost tmp = cost_simple_edge(root, chain_plan, removed_rel);
-		if (*cost_plan + tmp <= topology->budget) {
+		if (*cost_plan + tmp <= topology->budget * budget_soft_limit) {
 			RelOptInfo *join = make_join_rel(root, chain_plan, removed_rel);
 			if (join != NULL) {
 				set_cheapest(join);
 				if (join->cheapest_total_path != NULL) {
 					Cost join_cost = join->cheapest_total_path->total_cost;
-					if (*cost_plan + join_cost <= topology->budget) {
+					if (*cost_plan + join_cost <=
+					    topology->budget * budget_soft_limit) {
 						*cost_plan += join_cost;
 						return list_make1(join);
 					}
@@ -429,7 +428,7 @@ static List *plan_star(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 			Vertex *v_rel = (Vertex *)list_nth_cell(best_ray, ind_array[best_ind_ray]);
 			RelOptInfo *rel = v_rel->rel;
 			Cost prel_join_cost = cost_simple_edge(root, center_rel, rel);
-			if (*cost_plan + prel_join_cost <= topology->budget) {
+			if (*cost_plan + prel_join_cost <= topology->budget * budget_soft_limit) {
 				was_join = true;
 				RelOptInfo *new_center = make_join_rel(root, center_rel, rel);
 				set_cheapest(new_center);
@@ -467,7 +466,7 @@ static List *plan_star2(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 	List *partials = NIL;
 	List *chains_plans = NIL;
 	/* Plan each ray as an independent chain. */
-	ListCell *lc;
+	ListCell *lc = NULL;
 	foreach (lc, rays) {
 		List *ray_vertices = (List *)lfirst(lc); /* List* of Vertex* */
 		Topology chain_topology;
@@ -479,10 +478,10 @@ static List *plan_star2(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 		if (list_length(chain_plans) > 1) {
 			partials = lappend(partials, center_rel);
 			partials = list_concat(partials, chain_plans);
-			ListCell *lc2;
+			ListCell *lc2 = NULL;
 			for_each_cell (lc2, rays, lnext(rays, lc)) {
 				List *ray_vertices2 = (List *)lfirst(lc2);
-				ListCell *lc3;
+				ListCell *lc3 = NULL;
 				foreach (lc3, ray_vertices2) {
 					RelOptInfo *rel = (RelOptInfo *)lfirst(lc3);
 					partials = lappend(partials, rel);
@@ -511,7 +510,7 @@ static List *plan_star2(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 			}
 		}
 
-		if (*cost_plan + best_edge_cost > topology->budget) {
+		if (*cost_plan + best_edge_cost > topology->budget * budget_soft_limit) {
 			partials = lappend(partials, center_rel);
 
 			foreach (lc, chains_plans) {
@@ -530,236 +529,124 @@ static List *plan_star2(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 	}
 	return list_make1(center_rel);
 }
-
-static int bitmap_popcount64(uint64 bitmap)
+// Each vertex is responsible for exactly one relation
+static bool bitmap_connected(List *top_vertexes, uint64 bitmap)
 {
-	int count = 0;
-
-	while (bitmap != 0) {
-		bitmap &= (bitmap - 1);
-		count++;
+	Bitmapset *bms = NULL;
+	for (int i = 1; (uint64)1 << i <= bitmap; i++) {
+		if (bitmap & ((uint64)1 << i)) {
+			bms = bms_add_member(bms, i);
+		}
+	}
+	// need select nesessary vertexes from top_vertexes
+	List *vertexes = NIL;
+	ListCell *lc = NULL;
+	foreach (lc, top_vertexes) {
+		Vertex *v = (Vertex *)lfirst(lc);
+		RelOptInfo *rel = v->rel;
+		Bitmapset *relids = rel->relids;
+		if (bms_is_subset(relids, bms)) {
+			vertexes = lappend(vertexes, v);
+		}
 	}
 
-	return count;
-}
-
-static bool bitmap_connected(Vertex **vertexes, int n, uint64 bitmap, bool *visited, int *queue)
-{
-	int subset_size;
-	int head = 0;
-	int tail = 0;
-	int start = -1;
-	uint64 tmp;
-
-	if (bitmap == 0) {
-		return false;
+	// check that vertexes are connected
+	bool *used = (bool *)palloc0(list_length(vertexes) * sizeof(bool));
+	MemSet(used, true, list_length(vertexes) * sizeof(bool));
+	foreach (lc, vertexes) {
+		Vertex *v = (Vertex *)lfirst(lc);
+		used[v->index] = false;
 	}
-
-	memset(visited, 0, n * sizeof(bool));
-
-	tmp = bitmap;
-	while (tmp != 0) {
-		start++;
-		if ((tmp & 1) != 0) {
+	bool connected = true;
+	foreach (lc, vertexes) {
+		Vertex *v = (Vertex *)lfirst(lc);
+		if (!used[v->index]) {
+			dfs_check(vertexes, v, used);
+		}
+	}
+	for (int i = 0; i < list_length(vertexes); i++) {
+		if (!used[i]) {
+			connected = false;
 			break;
 		}
-		tmp >>= 1;
 	}
-
-	if (start < 0 || start >= n) {
-		return false;
-	}
-
-	queue[tail++] = start;
-	visited[start] = true;
-	subset_size = bitmap_popcount64(bitmap);
-
-	while (head < tail) {
-		int idx = queue[head++];
-		Vertex *v = vertexes[idx];
-		ListCell *lc;
-
-		foreach (lc, v->adj) {
-			Vertex *nbr = (Vertex *)lfirst(lc);
-			int nbr_idx = nbr->index;
-
-			if (nbr_idx < 0 || nbr_idx >= n) {
-				continue;
-			}
-
-			if (((bitmap >> nbr_idx) & 1) == 0) {
-				continue;
-			}
-
-			if (visited[nbr_idx]) {
-				continue;
-			}
-
-			visited[nbr_idx] = true;
-			queue[tail++] = nbr_idx;
-
-			if (tail >= subset_size) {
-				break;
-			}
-		}
-	}
-
-	return tail == subset_size;
-}
-
-static bool bitmaps_adjacent(Vertex **vertexes, int n, uint64 left_bm, uint64 right_bm)
-{
-	int i;
-
-	for (i = 0; i < n; i++) {
-		Vertex *v;
-		ListCell *lc;
-
-		if (((left_bm >> i) & 1) == 0) {
-			continue;
-		}
-
-		v = vertexes[i];
-		foreach (lc, v->adj) {
-			Vertex *nbr = (Vertex *)lfirst(lc);
-			int nbr_idx = nbr->index;
-
-			if (nbr_idx < 0 || nbr_idx >= n) {
-				continue;
-			}
-
-			if (((right_bm >> nbr_idx) & 1) != 0) {
-				return true;
-			}
-		}
-	}
-
-	return false;
+	list_free(vertexes);
+	pfree(used);
+	return connected;
 }
 
 static List *plan_dp_sub(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 {
 	int n = list_length(topology->vertexes);
-	Vertex **vertexes;
-	RelOptInfo **best_plans;
-	Cost *best_costs;
-	uint64 total_sets;
-	bool *visited;
-	int *queue;
-	int i;
-
-	if (n == 0) {
-		*cost_plan = 0;
-		return NIL;
-	}
-
-	if (n >= (int)(sizeof(uint64) * CHAR_BIT)) {
-		*cost_plan = 0;
-		return NIL;
-	}
-
-	total_sets = ((uint64)1) << n;
-	vertexes = (Vertex **)palloc0(n * sizeof(Vertex *));
+	RelOptInfo **best_plans = NULL;
+	Cost *best_costs = NULL;
+	uint64 total_sets = ((uint64)1) << n;
 	best_plans = (RelOptInfo **)palloc0(total_sets * sizeof(RelOptInfo *));
 	best_costs = (Cost *)palloc0(total_sets * sizeof(Cost));
-	visited = (bool *)palloc0(n * sizeof(bool));
-	queue = (int *)palloc0(n * sizeof(int));
+	List *partials = NIL;
+	update_indices(topology);
 
-	for (i = 0; i < n; i++) {
-		Vertex *v = (Vertex *)list_nth(topology->vertexes, i);
+	MemSet(best_costs, DBL_MAX, total_sets);
 
-		vertexes[i] = v;
-		vertexes[i]->index = i;
-	}
-
-	for (i = 0; i < total_sets; i++) {
-		best_costs[i] = DBL_MAX;
-	}
-
-	for (i = 0; i < n; i++) {
+	for (int i = 0; i < n; i++) {
 		uint64 mask = ((uint64)1) << i;
-
-		best_plans[mask] = vertexes[i]->rel;
-		set_cheapest(best_plans[mask]);
-		if (best_plans[mask]->cheapest_total_path != NULL) {
-			best_costs[mask] = best_plans[mask]->cheapest_total_path->total_cost;
-		}
+		ListCell *lc_v = list_nth_cell(topology->vertexes, i);
+		Vertex *v = (Vertex *)lfirst(lc_v);
+		best_plans[mask] = v->rel;
+		best_costs[mask] = best_plans[mask]->cheapest_total_path->total_cost;
 	}
 
 	for (uint64 join_bm = 1; join_bm < total_sets; join_bm++) {
-		uint64 left_bm;
-		int members = bitmap_popcount64(join_bm);
+		uint64 members = pg_popcount64(join_bm);
 
 		if (members == 1) {
 			continue;
 		}
 
-		if (!bitmap_connected(vertexes, n, join_bm, visited, queue)) {
+		if (!bitmap_connected(topology->vertexes, join_bm)) {
 			continue;
 		}
-
-		for (left_bm = (join_bm - 1) & join_bm; left_bm > 0;
-		     left_bm = (left_bm - 1) & join_bm) {
-			uint64 right_bm = join_bm ^ left_bm;
-			RelOptInfo *left_plan;
-			RelOptInfo *right_plan;
-			RelOptInfo *join_rel;
-
-			if (right_bm == 0) {
+		uint64 left_bm = (join_bm - 1) & join_bm;
+		while (join_bm != left_bm) {
+			uint64 right_bm = join_bm - left_bm;
+			if (left_bm >= right_bm) {
 				continue;
 			}
-
 			if (best_plans[left_bm] == NULL || best_plans[right_bm] == NULL) {
 				continue;
 			}
 
-			if (!bitmap_connected(vertexes, n, left_bm, visited, queue)) {
+			if (!bitmap_connected(topology->vertexes, left_bm)) {
 				continue;
 			}
-			if (!bitmap_connected(vertexes, n, right_bm, visited, queue)) {
+			if (!bitmap_connected(topology->vertexes, right_bm)) {
 				continue;
 			}
-			if (!bitmaps_adjacent(vertexes, n, left_bm, right_bm)) {
-				continue;
-			}
-
-			left_plan = best_plans[left_bm];
-			right_plan = best_plans[right_bm];
-			join_rel = make_join_rel(root, left_plan, right_plan);
-
-			if (join_rel == NULL) {
+			RelOptInfo *left_plan = best_plans[left_bm];
+			RelOptInfo *right_plan = best_plans[right_bm];
+			if (!has_simple_inner_edge(root, left_plan, right_plan)) {
 				continue;
 			}
 
-			set_cheapest(join_rel);
-			if (join_rel->cheapest_total_path == NULL) {
+			Cost prel_join_cost = cost_simple_edge(root, left_plan, right_plan);
+			if (*cost_plan + prel_join_cost > topology->budget * budget_soft_limit) {
+				return partials;
+			}
+			RelOptInfo *join = make_join_rel(root, left_plan, right_plan);
+			if (join == NULL) {
 				continue;
 			}
-
-			if (join_rel->cheapest_total_path->total_cost < best_costs[join_bm]) {
-				best_costs[join_bm] = join_rel->cheapest_total_path->total_cost;
-				best_plans[join_bm] = join_rel;
+			set_cheapest(join);
+			Cost join_cost = join->cheapest_total_path->total_cost;
+			*cost_plan += join_cost;
+			if (join->cheapest_total_path->total_cost < best_costs[join_bm]) {
+				best_costs[join_bm] = join->cheapest_total_path->total_cost;
+				best_plans[join_bm] = join;
 			}
+			partials = lappend(partials, join);
+			left_bm = (left_bm - join_bm) & join_bm;
 		}
 	}
-
-	{
-		List *result;
-
-		if (best_plans[total_sets - 1] != NULL) {
-			*cost_plan = best_costs[total_sets - 1];
-			result = list_make1(best_plans[total_sets - 1]);
-		} else {
-			*cost_plan = 0;
-			result = NIL;
-		}
-
-		pfree(queue);
-		pfree(visited);
-		pfree(best_costs);
-		pfree(best_plans);
-		pfree(vertexes);
-
-		return result;
-	}
+	RelOptInfo *best_plan = (RelOptInfo *)llast(partials);
+	return list_make1(best_plan);
 }

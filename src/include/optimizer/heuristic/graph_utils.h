@@ -33,4 +33,5 @@ extern Selectivity get_selectivity(PlannerInfo *root, RelOptInfo *rel1, RelOptIn
 extern void set_sel_topology(PlannerInfo *root, Topology *topology);
 extern void set_vol_topology(PlannerInfo *root, Topology *topology);
 extern Cost cost_simple_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2);
+extern void dfs_check(List *vertexes, Vertex *v, bool *used_vertexes);
 #endif
