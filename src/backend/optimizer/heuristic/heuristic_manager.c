@@ -25,6 +25,10 @@ static List *plan_chain_dp(PlannerInfo *root, Topology *topology, Cost *cost_pla
 static List *plan_cycle(PlannerInfo *root, Topology *topology, Cost *cost_plan);
 static List *plan_star(PlannerInfo *root, Topology *topology, Cost *cost_plan);
 static List *plan_star2(PlannerInfo *root, Topology *topology, Cost *cost_plan);
+static List *plan_dp_sub(PlannerInfo *root, Topology *topology, Cost *cost_plan);
+static bool bitmaps_adjacent(Vertex **vertexes, int n, uint64 left_bm, uint64 right_bm);
+static bool bitmap_connected(Vertex **vertexes, int n, uint64 bitmap, bool *visited, int *queue);
+static int bitmap_popcount64(uint64 bitmap);
 static void split_budget_among_topologies(List *topologies, uint64 budget, ListCell *init_cell);
 ///////////////////////////////////////////////////////////////////////////////////
 
@@ -525,4 +529,237 @@ static List *plan_star2(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 		chains_plans = list_delete_cell(partials, best_cell);
 	}
 	return list_make1(center_rel);
+}
+
+static int bitmap_popcount64(uint64 bitmap)
+{
+	int count = 0;
+
+	while (bitmap != 0) {
+		bitmap &= (bitmap - 1);
+		count++;
+	}
+
+	return count;
+}
+
+static bool bitmap_connected(Vertex **vertexes, int n, uint64 bitmap, bool *visited, int *queue)
+{
+	int subset_size;
+	int head = 0;
+	int tail = 0;
+	int start = -1;
+	uint64 tmp;
+
+	if (bitmap == 0) {
+		return false;
+	}
+
+	memset(visited, 0, n * sizeof(bool));
+
+	tmp = bitmap;
+	while (tmp != 0) {
+		start++;
+		if ((tmp & 1) != 0) {
+			break;
+		}
+		tmp >>= 1;
+	}
+
+	if (start < 0 || start >= n) {
+		return false;
+	}
+
+	queue[tail++] = start;
+	visited[start] = true;
+	subset_size = bitmap_popcount64(bitmap);
+
+	while (head < tail) {
+		int idx = queue[head++];
+		Vertex *v = vertexes[idx];
+		ListCell *lc;
+
+		foreach (lc, v->adj) {
+			Vertex *nbr = (Vertex *)lfirst(lc);
+			int nbr_idx = nbr->index;
+
+			if (nbr_idx < 0 || nbr_idx >= n) {
+				continue;
+			}
+
+			if (((bitmap >> nbr_idx) & 1) == 0) {
+				continue;
+			}
+
+			if (visited[nbr_idx]) {
+				continue;
+			}
+
+			visited[nbr_idx] = true;
+			queue[tail++] = nbr_idx;
+
+			if (tail >= subset_size) {
+				break;
+			}
+		}
+	}
+
+	return tail == subset_size;
+}
+
+static bool bitmaps_adjacent(Vertex **vertexes, int n, uint64 left_bm, uint64 right_bm)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		Vertex *v;
+		ListCell *lc;
+
+		if (((left_bm >> i) & 1) == 0) {
+			continue;
+		}
+
+		v = vertexes[i];
+		foreach (lc, v->adj) {
+			Vertex *nbr = (Vertex *)lfirst(lc);
+			int nbr_idx = nbr->index;
+
+			if (nbr_idx < 0 || nbr_idx >= n) {
+				continue;
+			}
+
+			if (((right_bm >> nbr_idx) & 1) != 0) {
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+static List *plan_dp_sub(PlannerInfo *root, Topology *topology, Cost *cost_plan)
+{
+	int n = list_length(topology->vertexes);
+	Vertex **vertexes;
+	RelOptInfo **best_plans;
+	Cost *best_costs;
+	uint64 total_sets;
+	bool *visited;
+	int *queue;
+	int i;
+
+	if (n == 0) {
+		*cost_plan = 0;
+		return NIL;
+	}
+
+	if (n >= (int)(sizeof(uint64) * CHAR_BIT)) {
+		*cost_plan = 0;
+		return NIL;
+	}
+
+	total_sets = ((uint64)1) << n;
+	vertexes = (Vertex **)palloc0(n * sizeof(Vertex *));
+	best_plans = (RelOptInfo **)palloc0(total_sets * sizeof(RelOptInfo *));
+	best_costs = (Cost *)palloc0(total_sets * sizeof(Cost));
+	visited = (bool *)palloc0(n * sizeof(bool));
+	queue = (int *)palloc0(n * sizeof(int));
+
+	for (i = 0; i < n; i++) {
+		Vertex *v = (Vertex *)list_nth(topology->vertexes, i);
+
+		vertexes[i] = v;
+		vertexes[i]->index = i;
+	}
+
+	for (i = 0; i < total_sets; i++) {
+		best_costs[i] = DBL_MAX;
+	}
+
+	for (i = 0; i < n; i++) {
+		uint64 mask = ((uint64)1) << i;
+
+		best_plans[mask] = vertexes[i]->rel;
+		set_cheapest(best_plans[mask]);
+		if (best_plans[mask]->cheapest_total_path != NULL) {
+			best_costs[mask] = best_plans[mask]->cheapest_total_path->total_cost;
+		}
+	}
+
+	for (uint64 join_bm = 1; join_bm < total_sets; join_bm++) {
+		uint64 left_bm;
+		int members = bitmap_popcount64(join_bm);
+
+		if (members == 1) {
+			continue;
+		}
+
+		if (!bitmap_connected(vertexes, n, join_bm, visited, queue)) {
+			continue;
+		}
+
+		for (left_bm = (join_bm - 1) & join_bm; left_bm > 0;
+		     left_bm = (left_bm - 1) & join_bm) {
+			uint64 right_bm = join_bm ^ left_bm;
+			RelOptInfo *left_plan;
+			RelOptInfo *right_plan;
+			RelOptInfo *join_rel;
+
+			if (right_bm == 0) {
+				continue;
+			}
+
+			if (best_plans[left_bm] == NULL || best_plans[right_bm] == NULL) {
+				continue;
+			}
+
+			if (!bitmap_connected(vertexes, n, left_bm, visited, queue)) {
+				continue;
+			}
+			if (!bitmap_connected(vertexes, n, right_bm, visited, queue)) {
+				continue;
+			}
+			if (!bitmaps_adjacent(vertexes, n, left_bm, right_bm)) {
+				continue;
+			}
+
+			left_plan = best_plans[left_bm];
+			right_plan = best_plans[right_bm];
+			join_rel = make_join_rel(root, left_plan, right_plan);
+
+			if (join_rel == NULL) {
+				continue;
+			}
+
+			set_cheapest(join_rel);
+			if (join_rel->cheapest_total_path == NULL) {
+				continue;
+			}
+
+			if (join_rel->cheapest_total_path->total_cost < best_costs[join_bm]) {
+				best_costs[join_bm] = join_rel->cheapest_total_path->total_cost;
+				best_plans[join_bm] = join_rel;
+			}
+		}
+	}
+
+	{
+		List *result;
+
+		if (best_plans[total_sets - 1] != NULL) {
+			*cost_plan = best_costs[total_sets - 1];
+			result = list_make1(best_plans[total_sets - 1]);
+		} else {
+			*cost_plan = 0;
+			result = NIL;
+		}
+
+		pfree(queue);
+		pfree(visited);
+		pfree(best_costs);
+		pfree(best_plans);
+		pfree(vertexes);
+
+		return result;
+	}
 }
