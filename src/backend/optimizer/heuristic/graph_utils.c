@@ -35,6 +35,17 @@ static Vertex *find_min_degree_vertex(List *sub);
 static double density(List *sub);
 static int count_edges(List *sub);
 
+/**
+ * @brief Check whether two relations have a legal simple join edge.
+ *
+ * Uses join clause and join order restriction checks while excluding overlap.
+ *
+ * @param root Planner context.
+ * @param rel1 First relation.
+ * @param rel2 Second relation.
+ *
+ * @return True if a simple inner edge exists between the relations.
+ */
 bool has_simple_inner_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 {
 	bool a = bms_overlap(rel1->relids, rel2->relids);
@@ -43,6 +54,17 @@ bool has_simple_inner_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2
 	bool result = !a && (b || c);
 	return result;
 }
+
+/**
+ * @brief Build a join graph from initial relations.
+ *
+ * Creates a vertex per relation and adds edges for simple inner joins.
+ *
+ * @param root Planner context.
+ * @param initial_rels Base relations to include.
+ *
+ * @return List of Vertex items representing the join graph.
+ */
 List *build_join_graph(PlannerInfo *root, List *initial_rels)
 {
 	List *vertexes = NIL;
@@ -71,6 +93,15 @@ List *build_join_graph(PlannerInfo *root, List *initial_rels)
 	print_graph(root, vertexes);
 	return vertexes;
 }
+
+/**
+ * @brief Emit a debug representation of the join graph.
+ *
+ * Logs each vertex, its cost, and adjacent edge costs.
+ *
+ * @param root Planner context.
+ * @param graph List of Vertex items.
+ */
 static void print_graph(PlannerInfo *root, List *graph)
 {
 	StringInfoData buf;
@@ -93,6 +124,17 @@ static void print_graph(PlannerInfo *root, List *graph)
 	pfree(buf.data);
 }
 
+/**
+ * @brief Depth-first traversal to collect a connected component.
+ *
+ * Marks visited vertices and returns the component list.
+ *
+ * @param v Start vertex.
+ * @param comp Current component list.
+ * @param used_vertexes Visited marker array.
+ *
+ * @return Updated component list.
+ */
 static List *dfs_component(Vertex *v, List *comp, bool *used_vertexes)
 {
 	used_vertexes[v->index] = true;
@@ -106,6 +148,14 @@ static List *dfs_component(Vertex *v, List *comp, bool *used_vertexes)
 	}
 	return comp;
 }
+
+/**
+ * @brief DFS utility to mark reachability in a vertex list.
+ *
+ * @param vertexes Full vertex list.
+ * @param v Start vertex.
+ * @param used_vertexes Visited marker array.
+ */
 void dfs_check(List *vertexes, Vertex *v, bool *used_vertexes)
 {
 	used_vertexes[v->index] = true;
@@ -117,6 +167,17 @@ void dfs_check(List *vertexes, Vertex *v, bool *used_vertexes)
 		}
 	}
 }
+
+/**
+ * @brief Split a join graph into connected components.
+ *
+ * Builds Topology objects and computes selectivity, volume, and complexity.
+ *
+ * @param root Planner context.
+ * @param vertexes Join graph vertices.
+ *
+ * @return List of Topology components.
+ */
 List *split_components(PlannerInfo *root, List *vertexes)
 {
 	List *comps = NIL; // List* of Component*
@@ -141,6 +202,21 @@ List *split_components(PlannerInfo *root, List *vertexes)
 	return comps;
 }
 
+/**
+ * @brief DFS-based cycle detection with selectivity pruning.
+ *
+ * Records cycles and marks vertices belonging to discovered cycles.
+ *
+ * @param root Planner context.
+ * @param prev Previous vertex in DFS.
+ * @param cur Current vertex in DFS.
+ * @param stack Current DFS stack.
+ * @param cycles Accumulated list of cycles.
+ * @param visited Per-vertex recursion marker.
+ * @param used_vertexes_comp Marks vertices already assigned to cycles.
+ *
+ * @return Updated list of cycles.
+ */
 static List *dfs_cycle(PlannerInfo *root, Vertex *prev, Vertex *cur, List *stack, List *cycles,
 		       bool *visited, bool *used_vertexes_comp)
 {
@@ -189,6 +265,17 @@ static List *dfs_cycle(PlannerInfo *root, Vertex *prev, Vertex *cur, List *stack
 	return cycles;
 }
 
+/**
+ * @brief Find cyclic subgraphs and return them as topologies.
+ *
+ * Uses DFS with selectivity thresholds to identify cycles.
+ *
+ * @param root Planner context.
+ * @param vertexes Join graph vertices.
+ * @param used_vertexes_comp Marks vertices already assigned to components.
+ *
+ * @return List of CYCLE topologies.
+ */
 List *find_cycles(PlannerInfo *root, List *vertexes, bool *used_vertexes_comp)
 {
 	int nverts_global = list_length(vertexes);
@@ -219,6 +306,16 @@ List *find_cycles(PlannerInfo *root, List *vertexes, bool *used_vertexes_comp)
 	return cyclic_topologies;
 }
 
+/**
+ * @brief Decide whether a vertex can be treated as a star center.
+ *
+ * Checks degree and relative volume of neighbors.
+ *
+ * @param center Candidate center vertex.
+ * @param used_vertexes Used marker array.
+ *
+ * @return True if the vertex qualifies as a star center.
+ */
 static bool is_star(Vertex *center, const bool *used_vertexes)
 {
 	int count_unused_neighbors = 0;
@@ -237,6 +334,19 @@ static bool is_star(Vertex *center, const bool *used_vertexes)
 	}
 	return count_unused_neighbors >= 3 || count_light_neighbors >= 2;
 }
+
+/**
+ * @brief Build a star topology around a center vertex.
+ *
+ * Grows rays up to a maximum length by selectivity.
+ *
+ * @param root Planner context.
+ * @param center Star center vertex.
+ * @param used_vertexes Used marker array.
+ * @param chains Output list of ray chains.
+ *
+ * @return List of vertices that form the star.
+ */
 static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes, List *chains)
 {
 	List *star = NIL;
@@ -276,6 +386,17 @@ static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes, L
 	return star;
 }
 
+/**
+ * @brief Find chain components among unused vertices.
+ *
+ * Each connected component is treated as a chain topology.
+ *
+ * @param root Planner context.
+ * @param vertexes Join graph vertices.
+ * @param used_vertexes Used marker array.
+ *
+ * @return List of CHAIN topologies.
+ */
 List *find_chains(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 {
 	List *chains = NIL; // List* of Topology*
@@ -297,6 +418,17 @@ List *find_chains(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 	return chains;
 }
 
+/**
+ * @brief Find star topologies among unused vertices.
+ *
+ * Detects star centers and builds star topologies with ray chains.
+ *
+ * @param root Planner context.
+ * @param vertexes Join graph vertices.
+ * @param used_vertexes Used marker array.
+ *
+ * @return List of STAR topologies.
+ */
 List *find_stars(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 {
 	List *stars = NIL;
@@ -324,6 +456,13 @@ List *find_stars(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 	return stars;
 }
 
+/**
+ * @brief Count edges inside a vertex subset.
+ *
+ * @param sub Vertex subset.
+ *
+ * @return Number of internal edges.
+ */
 static int count_edges(List *sub)
 {
 	int m = 0;
@@ -341,6 +480,11 @@ static int count_edges(List *sub)
 	return m;
 }
 
+/**
+ * @brief Reassign indices for topology vertices.
+ *
+ * @param component Topology to update.
+ */
 void update_indices(Topology *component)
 {
 	size_t i = 0;
@@ -352,6 +496,13 @@ void update_indices(Topology *component)
 	}
 }
 
+/**
+ * @brief Compute edge density for a vertex subset.
+ *
+ * @param sub Vertex subset.
+ *
+ * @return Density in [0,1], or 0 for small sets.
+ */
 static double density(List *sub)
 {
 	int n = list_length(sub);
@@ -364,6 +515,13 @@ static double density(List *sub)
 	return d;
 }
 
+/**
+ * @brief Find the minimum-degree vertex in a subset.
+ *
+ * @param sub Vertex subset.
+ *
+ * @return Vertex with the lowest internal degree.
+ */
 static Vertex *find_min_degree_vertex(List *sub)
 {
 	int best_deg = INT_MAX;
@@ -387,6 +545,17 @@ static Vertex *find_min_degree_vertex(List *sub)
 	return best_v;
 }
 
+/**
+ * @brief Find dense subgraphs and return them as topologies.
+ *
+ * Iteratively prunes low-degree vertices until density exceeds threshold.
+ *
+ * @param root Planner context.
+ * @param vertexes Join graph vertices.
+ * @param used Used marker array.
+ *
+ * @return List of DENSITY_GRAPH topologies.
+ */
 List *find_dense_subgraphs(PlannerInfo *root, List *vertexes, bool *used)
 {
 	List *dense_sets = NIL; // List* of Topology*
@@ -442,6 +611,12 @@ List *find_dense_subgraphs(PlannerInfo *root, List *vertexes, bool *used)
 	return dense_sets;
 }
 
+/**
+ * @brief Estimate topology complexity via connected subgraph counting.
+ *
+ * @param root Planner context.
+ * @param topology Topology to update.
+ */
 static void set_complexity_topology(PlannerInfo *root, Topology *topology)
 {
 	List *initial_rels = NIL;
@@ -461,6 +636,17 @@ static void set_complexity_topology(PlannerInfo *root, Topology *topology)
 	topology->ccp = subgraphs_count;
 }
 
+/**
+ * @brief Compute join selectivity for a relation pair.
+ *
+ * Builds a dummy join rel and evaluates clause selectivity.
+ *
+ * @param root Planner context.
+ * @param rel1 First relation.
+ * @param rel2 Second relation.
+ *
+ * @return Estimated selectivity for joining rel1 and rel2.
+ */
 Selectivity get_selectivity(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 { // TODO join_is_legal
 	RelOptInfo joinrel;
@@ -475,6 +661,12 @@ Selectivity get_selectivity(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel
 	return result;
 }
 
+/**
+ * @brief Compute topology volume as product of row counts.
+ *
+ * @param root Planner context.
+ * @param topology Topology to update.
+ */
 void set_vol_topology(PlannerInfo *root, Topology *topology)
 {
 	Cardinality vol = 1;
@@ -486,6 +678,16 @@ void set_vol_topology(PlannerInfo *root, Topology *topology)
 	}
 	topology->vol = vol;
 }
+
+/**
+ * @brief Compute topology selectivity from join clauses.
+ *
+ * Aggregates join clauses fully contained in the topology and applies
+ * selectivity estimation.
+ *
+ * @param root Planner context.
+ * @param topology Topology to update.
+ */
 void set_sel_topology(PlannerInfo *root, Topology *topology)
 {
 	Relids relids_topology = NULL;
@@ -548,6 +750,17 @@ void set_sel_topology(PlannerInfo *root, Topology *topology)
 	topology->sel = sel;
 }
 
+/**
+ * @brief Estimate the cheapest join cost between two relations.
+ *
+ * Considers nestloop, hashjoin, and mergejoin initial costs.
+ *
+ * @param root Planner context.
+ * @param rel1 First relation.
+ * @param rel2 Second relation.
+ *
+ * @return Minimum estimated join cost.
+ */
 Cost cost_simple_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 {
 	Cost min_cost = DBL_MAX;

@@ -19,7 +19,6 @@ static const double q = 0.25;
 static const double budget_soft_limit = 0.9;
 static const double k1 = 0.5;
 static const double k2 = 0.5;
-typedef enum { STANDARD, GOO, GEQO } TypeHeuristic;
 static List *choose_min_cost_cover(List *partial_plans);
 static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, Cost *cost_plan);
 
@@ -32,6 +31,16 @@ static List *plan_dp_sub(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 static bool bitmap_connected(List *top_vertexes, uint64 bitmap);
 static void split_budget_among_topologies(List *topologies, uint64 budget, ListCell *init_cell);
 
+/**
+ * @brief Distribute a budget across topologies by estimated complexity.
+ *
+ * Uses a weighted mix of topology CCP and selectivity to split the budget for
+ * the remaining list cells.
+ *
+ * @param topologies List of Topology items to receive budgets.
+ * @param budget Total budget to distribute.
+ * @param init_cell Starting cell for partial iteration (or NULL for full list).
+ */
 static void split_budget_among_topologies(List *topologies, uint64 budget, ListCell *init_cell)
 {
 	Cost sum_complexities = 0;
@@ -46,7 +55,18 @@ static void split_budget_among_topologies(List *topologies, uint64 budget, ListC
 		topology->budget = topology->ccp * budget / sum_complexities;
 	}
 }
-
+/**
+ * @brief Heuristic join search over a join graph with a budget.
+ *
+ * Splits the graph into components, plans each component with topology-specific
+ * heuristics and DP, then merges component plans using a greedy join order.
+ *
+ * @param root Planner context.
+ * @param initial_rels Base relations to join.
+ * @param budget Planning budget for all components.
+ *
+ * @return Final join plan for all relations.
+ */
 RelOptInfo *heuristic_join_search(PlannerInfo *root, List *initial_rels, int budget)
 {
 	List *graph = build_join_graph(root, initial_rels); // List* of Vertex*
@@ -104,7 +124,18 @@ RelOptInfo *heuristic_join_search(PlannerInfo *root, List *initial_rels, int bud
 	list_free(graph);
 	return final_plan;
 }
-
+/**
+ * @brief Greedy operator ordering (GOO) join ordering.
+ *
+ * Repeatedly joins the cheapest pair, optionally requiring a join clause.
+ *
+ * @param root Planner context.
+ * @param initial_rels Relations to join.
+ * @param clauseless If false, only joins with a simple inner edge.
+ * @param cost_plan Accumulates the chosen join costs.
+ *
+ * @return Final join plan.
+ */
 static RelOptInfo *goo(PlannerInfo *root, List *initial_rels, bool clauseless, Cost *cost_plan)
 {
 	while (list_length(initial_rels) > 1) {
@@ -142,14 +173,17 @@ static RelOptInfo *goo(PlannerInfo *root, List *initial_rels, bool clauseless, C
 	RelOptInfo *plan = (RelOptInfo *)linitial(initial_rels);
 	return plan;
 }
-
-/*
- * choose_min_cost_cover
+/**
+ * @brief Plan a topology using specialized heuristics, DP, and GOO fallback.
  *
- * Greedy set cover that selects the cheapest combination of partial plans
- * whose relids together cover all relids present in the input list. The
- * heuristic prefers plans with the lowest cost per newly covered rel and, in
- * case of ties, the cheapest plan overall.
+ * Tries a topology-specific planner first, falls back to DP if needed, then
+ * falls back to greedy ordering when budget is exhausted.
+ *
+ * @param root Planner context.
+ * @param topology Topology to plan.
+ * @param cost_plan Accumulates total cost of returned plans.
+ *
+ * @return A single completed plan when possible, otherwise a partial plan list.
  */
 static List *choose_min_cost_cover(List *partial_plans)
 {
@@ -205,9 +239,20 @@ static List *choose_min_cost_cover(List *partial_plans)
 	return coverage;
 }
 
+/**
+ * @brief Plans a topology using dynamic programming, specialized heuristics, and the GOO fallback.
+ *
+ * First, it tries to apply a specialized algorithm to the topology. If the budget for this is
+ *insufficient, it switches (while preserving the results) to dynamic programming. If the budget for
+ *dynamic programming is insufficient, it uses a greedy approach.
+ * @param root The planner context.
+ * @param topology The topology to plan.
+ * @param cost_plan An output parameter for the total cost of the returned plans.
+ *
+ * @return A list of resulting plans, either a single completed plan or partial plans.
+ **/
 static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 {
-	// cost_plan -- final cost plannitg this topology
 	RelOptInfo *plan = NULL;
 	List *partial_plans = NIL;
 	Cost cost_tmp_plan = 0;
@@ -255,6 +300,18 @@ static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, Cost *co
 	return plan;
 }
 
+/**
+ * @brief Dynamic programming join order for a chain topology.
+ *
+ * Builds best subplans for intervals, stopping early if the budget soft limit
+ * is exceeded, and returns a full plan or partial segments.
+ *
+ * @param root Planner context.
+ * @param topology Chain topology to plan.
+ * @param cost_plan Accumulates total cost of chosen joins.
+ *
+ * @return Single full plan or list of partial plans.
+ */
 static List *plan_chain_dp(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 {
 	int n = list_length(topology->vertexes);
@@ -336,6 +393,19 @@ static List *plan_chain_dp(PlannerInfo *root, Topology *topology, Cost *cost_pla
 
 	return plans;
 }
+
+/**
+ * @brief Plan a cycle by removing the most expensive edge and planning a chain.
+ *
+ * Converts the cycle into a chain by removing the edge with maximal estimated
+ * cardinality, then tries to reattach the removed vertex within budget.
+ *
+ * @param root Planner context.
+ * @param topology Cycle topology to plan.
+ * @param cost_plan Accumulates total cost of chosen joins.
+ *
+ * @return Single full plan or list of partial plans.
+ */
 static List *plan_cycle(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 {
 	int n = list_length(topology->vertexes);
@@ -397,6 +467,18 @@ static List *plan_cycle(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 	return lappend(chain_plans, vertexes[removed_idx]->rel);
 }
 
+/**
+ * @brief Greedy planning for a star topology from the center out.
+ *
+ * Joins rays to the center in order of minimal estimated cardinality until the
+ * budget is hit, then returns remaining relations as partials.
+ *
+ * @param root Planner context.
+ * @param topology Star topology to plan.
+ * @param cost_plan Accumulates total cost of chosen joins.
+ *
+ * @return Single full plan or list of partial plans.
+ */
 static List *plan_star(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 {
 	Vertex *center_vertex = (Vertex *)linitial(topology->vertexes);
@@ -457,7 +539,18 @@ static List *plan_star(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 	}
 	return partials;
 }
-
+/**
+ * @brief Plan star topology by chaining rays, then joining to the center.
+ *
+ * First plans each ray as a chain; if all succeed, it greedily joins the ray
+ * plans to the center by cheapest edge within budget.
+ *
+ * @param root Planner context.
+ * @param topology Star topology to plan.
+ * @param cost_plan Accumulates total cost of chosen joins.
+ *
+ * @return Single full plan or list of partial plans.
+ */
 static List *plan_star2(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 {
 	Vertex *center_vertex = (Vertex *)linitial(topology->vertexes);
@@ -529,7 +622,16 @@ static List *plan_star2(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 	}
 	return list_make1(center_rel);
 }
-// Each vertex is responsible for exactly one relation
+/**
+ * @brief Check whether a bitmap-selected subgraph is connected.
+ *
+ * Builds the vertex subset from the bitmap and verifies connectivity with DFS.
+ *
+ * @param top_vertexes All vertices in the topology.
+ * @param bitmap Bitmask selecting a subset of vertices.
+ *
+ * @return True if the selected subgraph is connected.
+ */
 static bool bitmap_connected(List *top_vertexes, uint64 bitmap)
 {
 	Bitmapset *bms = NULL;
@@ -574,7 +676,18 @@ static bool bitmap_connected(List *top_vertexes, uint64 bitmap)
 	pfree(used);
 	return connected;
 }
-
+/**
+ * @brief DP over connected subsets for a general topology.
+ *
+ * Enumerates connected subsets, joining compatible subplans within budget and
+ * returning the best plan built.
+ *
+ * @param root Planner context.
+ * @param topology Topology to plan.
+ * @param cost_plan Accumulates total cost of chosen joins.
+ *
+ * @return Single full plan or list containing the best plan found.
+ */
 static List *plan_dp_sub(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 {
 	int n = list_length(topology->vertexes);
@@ -586,7 +699,7 @@ static List *plan_dp_sub(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 	List *partials = NIL;
 	update_indices(topology);
 
-	MemSet(best_costs, DBL_MAX, total_sets);
+	memset(best_costs, DBL_MAX, total_sets);
 
 	for (int i = 0; i < n; i++) {
 		uint64 mask = ((uint64)1) << i;
