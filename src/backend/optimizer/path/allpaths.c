@@ -3438,7 +3438,8 @@ List *standard_join_search(PlannerInfo *root, int levels_needed, List *initial_r
 		}
 		if (!done) {
 			List *partial_plans = root->join_rel_level[lev - 1];
-			partial_plans = list_concat(partial_plans, root->join_rel_level[lev - 1]);
+			partial_plans = list_concat(partial_plans, root->join_rel_level[lev]);
+			root->join_rel_level = NULL;
 			return partial_plans;
 		}
 	}

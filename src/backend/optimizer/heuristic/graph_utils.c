@@ -3,6 +3,7 @@
 #include "nodes/bitmapset.h"
 #include "nodes/pathnodes.h"
 #include <limits.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
 #include "optimizer/heuristic/graph_utils.h"
@@ -17,20 +18,19 @@
 #include <optimizer/cost.h>
 #include "optimizer/restrictinfo.h"
 #include "utils/lsyscache.h"
+#include "lib/stringinfo.h"
 
 static const uint64 dphyp_geqo_cc_threshold = 10000;
 static const double THRESH = 0.9;
 static const Selectivity border_selectivity = 0.4;
 static const int max_ray_length = 3;
-
+static const int min_length_cycle = 3;
 static void set_complexity_topology(PlannerInfo *root, Topology *topology);
 static List *dfs_component(Vertex *v, List *comp, bool *used_vertexes);
-static List *dfs_cycle(PlannerInfo *root, Vertex *prev, Vertex *cur, List *stack, List *cycles,
-		       bool *visited,
-		       bool *used_vertexes_comp); // stack is list of Vertex*
+static bool dfs_cycle(PlannerInfo *root, Vertex *prev, Vertex *cur, List **stack, bool *visited,
+		      bool *used_vertexes_comp); // stack is list of Vertex*
 static bool is_star(Vertex *center, const bool *used_vertexes);
-static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes, List *chains);
-static void print_graph(PlannerInfo *root, List *graph);
+static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes, List **chains);
 static Vertex *find_min_degree_vertex(List *sub);
 static double density(List *sub);
 static int count_edges(List *sub);
@@ -53,6 +53,116 @@ bool has_simple_inner_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2
 	bool c = have_join_order_restriction(root, rel1, rel2);
 	bool result = !a && (b || c);
 	return result;
+}
+
+/**
+ * @brief Emit a debug representation of the join graph.
+ *
+ * Logs each vertex, its cost, and adjacent edge costs.
+ *
+ * @param root Planner context.
+ * @param graph List of Vertex items.
+ */
+static void print_graph(PlannerInfo *root, List *graph)
+{
+	StringInfoData buf;
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "\n----------------------PRINT_GRAPH\n");
+	ListCell *lc = NULL;
+	foreach (lc, graph) {
+		Vertex *vertex = (Vertex *)lfirst(lc);
+		Cost cost_rel = vertex->rel->cheapest_total_path->total_cost;
+		appendStringInfo(&buf, "%zu(%lf):", vertex->index, cost_rel);
+		ListCell *lc2 = NULL;
+		foreach (lc2, vertex->adj) {
+			Vertex *neighbor = (Vertex *)lfirst(lc2);
+			Cost cost_edge = cost_simple_edge(root, vertex->rel, neighbor->rel);
+			appendStringInfo(&buf, " %zu(%lf)", neighbor->index, cost_edge);
+		}
+		appendStringInfo(&buf, "\n");
+	}
+	ereport(NOTICE, (errmsg("%s\n", buf.data)));
+	pfree(buf.data);
+}
+/**
+ * @brief Debug print a topology.
+ *
+ * Prints the type of the topology, selectivity, count connected pairs of subgraphs,
+ * volume, and budget. If the topology is a star,
+ * prints the center and chains of the star (each chain on a new line).
+ *
+ * Also prints Bitmapset of each vertex in the topology.
+ * @param topology Topology to print.
+ */
+void print_topology(Topology *topology)
+{
+	StringInfoData buf;
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "\n----------------------PRINT_TOPOLOGY\n");
+	switch (topology->form) {
+	case CHAIN: {
+		appendStringInfo(&buf, "Chain\n");
+		break;
+	}
+	case CYCLE: {
+		appendStringInfo(&buf, "Cycle\n");
+		break;
+	}
+	case DENSITY_GRAPH: {
+		appendStringInfo(&buf, "Density graph\n");
+		break;
+	}
+	case STAR: {
+		appendStringInfo(&buf, "Star\n");
+		break;
+	}
+	case COMPONENT: {
+		appendStringInfo(&buf, "Component\n");
+		break;
+	}
+	}
+	appendStringInfo(&buf, "sel: %.10lf\n", topology->sel);
+	appendStringInfo(&buf, "ccp: %lu\n", topology->ccp);
+	appendStringInfo(&buf, "vol: %lf\n", topology->vol);
+	appendStringInfo(&buf, "budget: %lf\n", topology->budget);
+	appendStringInfo(&buf, "vertexes: ");
+
+	if (topology->form == STAR) {
+		Vertex *center = (Vertex *)linitial(topology->vertexes);
+		appendStringInfo(&buf, "Center: %zu\n", center->index);
+		ListCell *lc = NULL;
+		foreach (lc, topology->extended_info) {
+			List *chain = (List *)lfirst(lc);
+			appendStringInfo(&buf, "Chain: ");
+			ListCell *lc2 = NULL;
+			foreach (lc2, chain) {
+				Vertex *v = (Vertex *)lfirst(lc2);
+				appendStringInfo(&buf, "%zu ", v->index);
+			}
+			appendStringInfo(&buf, "\n");
+		}
+	} else {
+		ListCell *lc = NULL;
+		foreach (lc, topology->vertexes) {
+			Vertex *v = (Vertex *)lfirst(lc);
+			appendStringInfo(&buf, "%zu ", v->index);
+		}
+		appendStringInfo(&buf, "\n");
+	}
+	// print bitmap each vertex
+	ListCell *lc = NULL;
+	foreach (lc, topology->vertexes) {
+		Vertex *v = (Vertex *)lfirst(lc);
+
+		appendStringInfo(&buf, "bitmap v_%zu: ", v->index);
+		int i = -1;
+		while ((i = bms_next_member(v->rel->relids, i)) >= 0) {
+			appendStringInfo(&buf, "%d ", i);
+		}
+		appendStringInfo(&buf, "\n");
+	}
+	ereport(NOTICE, (errmsg("%s\n", buf.data)));
+	pfree(buf.data);
 }
 
 /**
@@ -92,36 +202,6 @@ List *build_join_graph(PlannerInfo *root, List *initial_rels)
 	}
 	print_graph(root, vertexes);
 	return vertexes;
-}
-
-/**
- * @brief Emit a debug representation of the join graph.
- *
- * Logs each vertex, its cost, and adjacent edge costs.
- *
- * @param root Planner context.
- * @param graph List of Vertex items.
- */
-static void print_graph(PlannerInfo *root, List *graph)
-{
-	StringInfoData buf;
-	initStringInfo(&buf);
-	appendStringInfo(&buf, "\n----------------------\n");
-	ListCell *lc = NULL;
-	foreach (lc, graph) {
-		Vertex *vertex = (Vertex *)lfirst(lc);
-		Cost cost_rel = vertex->rel->cheapest_total_path->total_cost;
-		appendStringInfo(&buf, "%zu(%lf):", vertex->index, cost_rel);
-		ListCell *lc2 = NULL;
-		foreach (lc2, vertex->adj) {
-			Vertex *neighbor = (Vertex *)lfirst(lc2);
-			Cost cost_edge = cost_simple_edge(root, vertex->rel, neighbor->rel);
-			appendStringInfo(&buf, " %zu(%lf)", neighbor->index, cost_edge);
-		}
-		appendStringInfo(&buf, "\n");
-	}
-	ereport(NOTICE, (errmsg("%s\n", buf.data)));
-	pfree(buf.data);
 }
 
 /**
@@ -202,26 +282,12 @@ List *split_components(PlannerInfo *root, List *vertexes)
 	return comps;
 }
 
-/**
- * @brief DFS-based cycle detection with selectivity pruning.
- *
- * Records cycles and marks vertices belonging to discovered cycles.
- *
- * @param root Planner context.
- * @param prev Previous vertex in DFS.
- * @param cur Current vertex in DFS.
- * @param stack Current DFS stack.
- * @param cycles Accumulated list of cycles.
- * @param visited Per-vertex recursion marker.
- * @param used_vertexes_comp Marks vertices already assigned to cycles.
- *
- * @return Updated list of cycles.
- */
-static List *dfs_cycle(PlannerInfo *root, Vertex *prev, Vertex *cur, List *stack, List *cycles,
-		       bool *visited, bool *used_vertexes_comp)
+// find cycle
+static bool dfs_cycle(PlannerInfo *root, Vertex *prev, Vertex *cur, List **stack, bool *visited,
+		      bool *used_vertexes_comp)
 {
 	visited[cur->index] = true;
-	stack = lappend(stack, cur);
+	*stack = lappend(*stack, cur);
 	ListCell *lc = NULL;
 	foreach (lc, cur->adj) {
 		Vertex *nbr = (Vertex *)lfirst(lc);
@@ -232,64 +298,56 @@ static List *dfs_cycle(PlannerInfo *root, Vertex *prev, Vertex *cur, List *stack
 		if (sel > border_selectivity) {
 			continue;
 		}
-		if (visited[nbr->index] && stack->length >= 3) {
+		if (visited[nbr->index] && (*stack)->length >= min_length_cycle) {
 			List *cycle = NIL;
 			ListCell *lc2 = NULL;
-			foreach (lc2, stack) {
+			foreach (lc2, *stack) {
 				Vertex *it = (Vertex *)lfirst(lc2);
 				if (it->index == nbr->index) {
 					break;
 				}
 			}
 			ListCell *lc3 = NULL;
-			for_each_cell (lc3, stack, lc2) {
+			for_each_cell (lc3, *stack, lc2) {
 				Vertex *it = (Vertex *)lfirst(lc3);
 				cycle = lappend(cycle, it);
 				used_vertexes_comp[it->index] = true;
 			}
-			cycles = lappend(cycles, cycle);
-			break;
+			list_free(*stack);
+			*stack = cycle;
+			return true;
 		}
 		if (!visited[nbr->index] && !used_vertexes_comp[nbr->index]) {
-			cycles = dfs_cycle(root,
-					   cur,
-					   nbr,
-					   stack,
-					   cycles,
-					   visited,
-					   used_vertexes_comp);
+			bool was_cycle =
+				dfs_cycle(root, cur, nbr, stack, visited, used_vertexes_comp);
+			if (was_cycle) {
+				return true;
+			}
 		}
 	}
 	visited[cur->index] = false;
-	stack = list_delete_nth_cell(stack, stack->length - 1);
-	return cycles;
+	*stack = list_delete_nth_cell(*stack, (*stack)->length - 1);
+	return false;
 }
 
-/**
- * @brief Find cyclic subgraphs and return them as topologies.
- *
- * Uses DFS with selectivity thresholds to identify cycles.
- *
- * @param root Planner context.
- * @param vertexes Join graph vertices.
- * @param used_vertexes_comp Marks vertices already assigned to components.
- *
- * @return List of CYCLE topologies.
- */
+// find non intersecting cycles
 List *find_cycles(PlannerInfo *root, List *vertexes, bool *used_vertexes_comp)
 {
-	int nverts_global = list_length(vertexes);
+	int n_local = list_length(vertexes);
 	List *cycles = NIL; // List* of List* of Vertex*
-	bool *visited = (bool *)palloc0(nverts_global * sizeof(bool));
-	List *stack = NIL;
+	bool *visited = (bool *)palloc0(n_local * sizeof(bool));
 	ListCell *lc = NULL;
 	foreach (lc, vertexes) {
 		Vertex *v = (Vertex *)lfirst(lc);
 		if (used_vertexes_comp[v->index]) {
 			continue;
 		}
-		MemSet(visited, false, nverts_global * sizeof(bool));
-		cycles = dfs_cycle(root, NULL, v, stack, cycles, visited, used_vertexes_comp);
+		List *stack = NIL;
+		MemSet(visited, false, n_local * sizeof(bool));
+		dfs_cycle(root, NULL, v, &stack, visited, used_vertexes_comp);
+		if (stack) {
+			cycles = lappend(cycles, stack);
+		}
 	}
 	List *cyclic_topologies = NIL;
 	foreach (lc, cycles) {
@@ -347,7 +405,7 @@ static bool is_star(Vertex *center, const bool *used_vertexes)
  *
  * @return List of vertices that form the star.
  */
-static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes, List *chains)
+static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes, List **chains)
 {
 	List *star = NIL;
 	star = lappend(star, center);
@@ -381,7 +439,7 @@ static List *find_star(PlannerInfo *root, Vertex *center, bool *used_vertexes, L
 			curr = new_neighbor;
 		}
 		star = list_concat(star, chain);
-		chains = lappend(chains, chain);
+		*chains = lappend(*chains, chain);
 	}
 	return star;
 }
@@ -442,8 +500,8 @@ List *find_stars(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 		List *star = find_star(root,
 				       v,
 				       used_vertexes,
-				       chains); // List* of {star_vertex, List1 of chain
-						// vertex, List_n of chain vertex}
+				       &chains); // List* of {star_vertex, List1 of chain
+						 // vertex, List_n of chain vertex}
 		Topology *topology = (Topology *)palloc0(sizeof(Topology));
 		topology->vertexes = star; // TODO
 		topology->form = STAR;
@@ -466,10 +524,10 @@ List *find_stars(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 static int count_edges(List *sub)
 {
 	int m = 0;
-	ListCell *lc;
+	ListCell *lc = NULL;
 	foreach (lc, sub) {
 		Vertex *v1 = (Vertex *)lfirst(lc);
-		ListCell *lc2;
+		ListCell *lc2 = NULL;
 		foreach (lc2, v1->adj) {
 			Vertex *v2 = (Vertex *)lfirst(lc2);
 			if (v1->index < v2->index && list_member_ptr(sub, v2)) {
@@ -488,7 +546,7 @@ static int count_edges(List *sub)
 void update_indices(Topology *component)
 {
 	size_t i = 0;
-	ListCell *lc;
+	ListCell *lc = NULL;
 	foreach (lc, component->vertexes) {
 		Vertex *v = (Vertex *)lfirst(lc);
 		v->index = i;
@@ -526,11 +584,11 @@ static Vertex *find_min_degree_vertex(List *sub)
 {
 	int best_deg = INT_MAX;
 	Vertex *best_v = NULL;
-	ListCell *lc;
+	ListCell *lc = NULL;
 	foreach (lc, sub) {
 		Vertex *v = (Vertex *)lfirst(lc);
 		int deg = 0;
-		ListCell *lc2;
+		ListCell *lc2 = NULL;
 		foreach (lc2, v->adj) {
 			if (list_member_ptr(sub, lfirst(lc2))) {
 				deg++;
@@ -562,7 +620,7 @@ List *find_dense_subgraphs(PlannerInfo *root, List *vertexes, bool *used)
 
 	while (true) {
 		List *candidate = NIL;
-		ListCell *lc;
+		ListCell *lc = NULL;
 		foreach (lc, vertexes) {
 			Vertex *v = (Vertex *)lfirst(lc);
 			if (!used[v->index]) {
@@ -620,7 +678,7 @@ List *find_dense_subgraphs(PlannerInfo *root, List *vertexes, bool *used)
 static void set_complexity_topology(PlannerInfo *root, Topology *topology)
 {
 	List *initial_rels = NIL;
-	ListCell *lc;
+	ListCell *lc = NULL;
 	foreach (lc, topology->vertexes) {
 		Vertex *v = (Vertex *)lfirst(lc);
 		initial_rels = lappend(initial_rels, v->rel);
@@ -648,7 +706,7 @@ static void set_complexity_topology(PlannerInfo *root, Topology *topology)
  * @return Estimated selectivity for joining rel1 and rel2.
  */
 Selectivity get_selectivity(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
-{ // TODO join_is_legal
+{
 	RelOptInfo joinrel;
 	joinrel.relids = bms_union(rel1->relids, rel2->relids);
 	SpecialJoinInfo sjinfo;
@@ -693,7 +751,7 @@ void set_sel_topology(PlannerInfo *root, Topology *topology)
 	Relids relids_topology = NULL;
 	List *vertexes = topology->vertexes;
 	List *clauses = NIL;
-	ListCell *lc;
+	ListCell *lc = NULL;
 
 	foreach (lc, vertexes) {
 		RelOptInfo *rel = ((Vertex *)lfirst(lc))->rel;
@@ -703,7 +761,7 @@ void set_sel_topology(PlannerInfo *root, Topology *topology)
 
 	foreach (lc, vertexes) {
 		RelOptInfo *rel = ((Vertex *)lfirst(lc))->rel;
-		ListCell *lc2;
+		ListCell *lc2 = NULL;
 
 		foreach (lc2, rel->joininfo) {
 			RestrictInfo *rinfo = (RestrictInfo *)lfirst(lc2);
@@ -777,8 +835,8 @@ Cost cost_simple_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 		List *mergeclauses = NIL;
 		SpecialJoinInfo sjinfo;
 		RelOptInfo joinrel;
-		List *restrictlist;
-		ListCell *lc;
+		List *restrictlist = NIL;
+		ListCell *lc = NULL;
 
 		if (PATH_PARAM_BY_REL(outer_path, inner_rel) ||
 		    PATH_PARAM_BY_REL(inner_path, outer_rel)) {

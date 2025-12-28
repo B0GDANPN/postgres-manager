@@ -24,9 +24,9 @@
 #include "partitioning/partbounds.h"
 #include "utils/memutils.h"
 
-static void make_rels_by_clause_joins(PlannerInfo *root, RelOptInfo *old_rel, List *other_rels,
+static bool make_rels_by_clause_joins(PlannerInfo *root, RelOptInfo *old_rel, List *other_rels,
 				      int first_rel_idx, Cost budget, Cost *cost);
-static void make_rels_by_clauseless_joins(PlannerInfo *root, RelOptInfo *old_rel, List *other_rels,
+static bool make_rels_by_clauseless_joins(PlannerInfo *root, RelOptInfo *old_rel, List *other_rels,
 					  Cost budget, Cost *cost);
 static bool has_join_restriction(PlannerInfo *root, RelOptInfo *rel);
 static bool has_legal_joinclause(PlannerInfo *root, RelOptInfo *rel);
@@ -105,12 +105,15 @@ bool join_search_one_level(PlannerInfo *root, int level, Cost budget, Cost *cost
 			if (*cost > budget) {
 				return false;
 			}
-			make_rels_by_clause_joins(root,
-						  old_rel,
-						  joinrels[1],
-						  first_rel,
-						  budget,
-						  cost);
+			bool result = make_rels_by_clause_joins(root,
+								old_rel,
+								joinrels[1],
+								first_rel,
+								budget,
+								cost);
+			if (!result) {
+				return false;
+			}
 		} else {
 			/*
 			 * Oops, we have a relation that is not joined to any other
@@ -127,7 +130,14 @@ bool join_search_one_level(PlannerInfo *root, int level, Cost budget, Cost *cost
 			if (*cost > budget) {
 				return false;
 			}
-			make_rels_by_clauseless_joins(root, old_rel, joinrels[1], budget, cost);
+			bool result = make_rels_by_clauseless_joins(root,
+								    old_rel,
+								    joinrels[1],
+								    budget,
+								    cost);
+			if (!result) {
+				return false;
+			}
 		}
 	}
 
@@ -227,7 +237,14 @@ bool join_search_one_level(PlannerInfo *root, int level, Cost budget, Cost *cost
 			if (*cost > budget) {
 				return false;
 			}
-			make_rels_by_clauseless_joins(root, old_rel, joinrels[1], budget, cost);
+			bool result = make_rels_by_clauseless_joins(root,
+								    old_rel,
+								    joinrels[1],
+								    budget,
+								    cost);
+			if (!result) {
+				return false;
+			}
 		}
 
 		/*----------
@@ -276,7 +293,7 @@ bool join_search_one_level(PlannerInfo *root, int level, Cost budget, Cost *cost
  * Currently, this is only used with initial rels in other_rels, but it
  * will work for joining to joinrels too.
  */
-static void make_rels_by_clause_joins(PlannerInfo *root, RelOptInfo *old_rel, List *other_rels,
+static bool make_rels_by_clause_joins(PlannerInfo *root, RelOptInfo *old_rel, List *other_rels,
 				      int first_rel_idx, Cost budget, Cost *cost)
 {
 	ListCell *l;
@@ -290,7 +307,7 @@ static void make_rels_by_clause_joins(PlannerInfo *root, RelOptInfo *old_rel, Li
 		     have_join_order_restriction(root, old_rel, other_rel))) {
 			Cost tmp = cost_simple_edge(root, old_rel, other_rel);
 			if (*cost + tmp > budget) {
-				return;
+				return false;
 			}
 			(void)make_join_rel(root, old_rel, other_rel);
 			*cost += tmp;
@@ -311,7 +328,7 @@ static void make_rels_by_clause_joins(PlannerInfo *root, RelOptInfo *old_rel, Li
  * Currently, this is only used with initial rels in other_rels, but it would
  * work for joining to joinrels too.
  */
-static void make_rels_by_clauseless_joins(PlannerInfo *root, RelOptInfo *old_rel, List *other_rels,
+static bool make_rels_by_clauseless_joins(PlannerInfo *root, RelOptInfo *old_rel, List *other_rels,
 					  Cost budget, Cost *cost)
 {
 	ListCell *l;
@@ -322,12 +339,13 @@ static void make_rels_by_clauseless_joins(PlannerInfo *root, RelOptInfo *old_rel
 		if (!bms_overlap(other_rel->relids, old_rel->relids)) {
 			Cost tmp = cost_simple_edge(root, old_rel, other_rel);
 			if (*cost + tmp > budget) {
-				return;
+				return false;
 			}
 			(void)make_join_rel(root, old_rel, other_rel);
 			*cost += tmp;
 		}
 	}
+	return true;
 }
 
 /*
