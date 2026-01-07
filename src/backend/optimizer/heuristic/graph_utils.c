@@ -907,6 +907,20 @@ Cost cost_simple_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 			List *innersortkeys =
 				make_inner_pathkeys_for_merge(root, mergeclauses, outersortkeys);
 
+			/*
+			 * Callers are expected to clear the explicit sort keys when the input path
+			 * is already ordered.  Be forgiving here in case a caller forgets to do so
+			 * and avoid redundant work instead of tripping the assertion below.
+			 */
+			if (outersortkeys &&
+			    pathkeys_contained_in(outersortkeys, outer_path->pathkeys)) {
+				outersortkeys = NIL;
+			}
+
+			if (innersortkeys &&
+			    pathkeys_contained_in(innersortkeys, inner_path->pathkeys)) {
+				innersortkeys = NIL;
+			}
 			initial_cost_mergejoin(root,
 					       &workspace,
 					       JOIN_INNER,

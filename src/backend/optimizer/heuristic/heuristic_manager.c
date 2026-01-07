@@ -194,8 +194,8 @@ static RelOptInfo *goo(PlannerInfo *root, List *initial_rels, bool clauseless, C
 	return plan;
 }
 /**
- * @brief Given a list of partial plans, choose a subset of them to cover all relids with the
- * minimum cost.
+ * @brief Given a list of partial plans, choose a subset of them to cover all
+ * relids with the minimum cost.
  *
  * @param partial_plans List of partial plans.
  *
@@ -254,16 +254,20 @@ static List *choose_min_cost_cover(List *partial_plans)
 }
 
 /**
- * @brief Plans a topology using dynamic programming, specialized heuristics, and the GOO fallback.
+ * @brief Plans a topology using dynamic programming, specialized heuristics,
+ *and the GOO fallback.
  *
- * First, it tries to apply a specialized algorithm to the topology. If the budget for this is
- *insufficient, it switches (while preserving the results) to dynamic programming. If the budget for
- *dynamic programming is insufficient, it uses a greedy approach.
+ * First, it tries to apply a specialized algorithm to the topology. If the
+ *budget for this is insufficient, it switches (while preserving the results) to
+ *dynamic programming. If the budget for dynamic programming is insufficient, it
+ *uses a greedy approach.
  * @param root The planner context.
  * @param topology The topology to plan.
- * @param cost_plan An output parameter for the total cost of the returned plans.
+ * @param cost_plan An output parameter for the total cost of the returned
+ *plans.
  *
- * @return A list of resulting plans, either a single completed plan or partial plans.
+ * @return A list of resulting plans, either a single completed plan or partial
+ *plans.
  **/
 static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology *topology, Cost *cost_plan)
 {
