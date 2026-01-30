@@ -19,17 +19,15 @@
    =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
  */
 
-
 #ifndef GEQO_POOL_H
 #define GEQO_POOL_H
 
 #include "optimizer/geqo.h"
 
-
 extern Pool *alloc_pool(PlannerInfo *root, int pool_size, int string_length);
 extern void free_pool(PlannerInfo *root, Pool *pool);
 
-extern void random_init_pool(PlannerInfo *root, Pool *pool);
+extern void random_init_pool(PlannerInfo *root, Pool *pool, List *order_candidates);
 extern Chromosome *alloc_chromo(PlannerInfo *root, int string_length);
 extern void free_chromo(PlannerInfo *root, Chromosome *chromo);
 

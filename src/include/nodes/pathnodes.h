@@ -583,6 +583,7 @@ struct PlannerInfo
 
 	/* PartitionPruneInfos added in this query's plan. */
 	List	   *partPruneInfos;
+	int			last_topology_id;
 };
 
 

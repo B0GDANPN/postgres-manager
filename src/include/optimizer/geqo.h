@@ -23,9 +23,10 @@
 #define GEQO_H
 
 #include "common/pg_prng.h"
+#include "nodes/nodes.h"
 #include "nodes/pathnodes.h"
+#include "nodes/pg_list.h"
 #include "optimizer/geqo_gene.h"
-
 
 /* GEQO debug flag */
 /*
@@ -42,7 +43,6 @@
  #define OX2
  */
 #define ERX
-
 
 /*
  * Configuration options
@@ -68,7 +68,6 @@ extern PGDLLIMPORT double Geqo_selection_bias;
 
 extern PGDLLIMPORT double Geqo_seed;	/* 0 .. 1 */
 
-
 /*
  * Private state for a GEQO run --- accessible via root->join_search_private
  */
@@ -76,12 +75,14 @@ typedef struct
 {
 	List	   *initial_rels;	/* the base relations we are joining */
 	pg_prng_state random_state; /* PRNG state */
+	Cost		budget;
+	Cost	   *cost_plan;
+	List	   *partial_plans;
 } GeqoPrivateData;
 
-
 /* routines in geqo_main.c */
-extern RelOptInfo *geqo(PlannerInfo *root,
-						int number_of_rels, List *initial_rels);
+extern List *geqo(PlannerInfo *root, int number_of_rels, List *initial_rels, List *order_candidates,
+				  Cost budget, Cost *cost_plan);
 
 /* routines in geqo_eval.c */
 extern Cost geqo_eval(PlannerInfo *root, Gene *tour, int num_gene);

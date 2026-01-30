@@ -20,17 +20,17 @@
  */
 
 /* -- parts of this are adapted from D. Whitley's Genitor algorithm -- */
-
 #include "postgres.h"
+#include "nodes/pg_list.h"
 
 #include <float.h>
 #include <limits.h>
 #include <math.h>
+#include <string.h>
 
 #include "optimizer/geqo_copy.h"
 #include "optimizer/geqo_pool.h"
 #include "optimizer/geqo_recombination.h"
-
 
 static int	compare(const void *arg1, const void *arg2);
 
@@ -56,7 +56,9 @@ alloc_pool(PlannerInfo *root, int pool_size, int string_length)
 	/* all gene */
 	chromo = (Chromosome *) new_pool->data; /* vector of all chromos */
 	for (i = 0; i < pool_size; i++)
+	{
 		chromo[i].string = palloc((string_length + 1) * sizeof(Gene));
+	}
 
 	return new_pool;
 }
@@ -74,7 +76,9 @@ free_pool(PlannerInfo *root, Pool *pool)
 	/* all gene */
 	chromo = (Chromosome *) pool->data; /* vector of all chromos */
 	for (i = 0; i < pool->size; i++)
+	{
 		pfree(chromo[i].string);
+	}
 
 	/* all chromosome */
 	pfree(pool->data);
@@ -88,7 +92,7 @@ free_pool(PlannerInfo *root, Pool *pool)
  *		initialize genetic pool
  */
 void
-random_init_pool(PlannerInfo *root, Pool *pool)
+random_init_pool(PlannerInfo *root, Pool *pool, List *order_candidates)
 {
 	Chromosome *chromo = (Chromosome *) pool->data;
 	int			i;
@@ -105,23 +109,40 @@ random_init_pool(PlannerInfo *root, Pool *pool)
 	i = 0;
 	while (i < pool->size)
 	{
-		init_tour(root, chromo[i].string, pool->string_length);
-		pool->data[i].worth = geqo_eval(root, chromo[i].string,
-										pool->string_length);
+		if (i >= list_length(order_candidates))
+		{
+			init_tour(root, chromo[i].string, pool->string_length);
+		}
+		else
+		{
+			//need get order from
+				int		   *order = (int *) lfirst(list_nth_cell(order_candidates, i));
+
+			memcpy(chromo[i].string, order, pool->string_length * sizeof(Gene));
+		}
+		pool->data[i].worth = geqo_eval(root, chromo[i].string, pool->string_length);
 		if (pool->data[i].worth < DBL_MAX)
+		{
 			i++;
+		}
 		else
 		{
 			bad++;
 			if (i == 0 && bad >= 10000)
+			{
 				elog(ERROR, "geqo failed to make a valid plan");
+			}
 		}
 	}
 
 #ifdef GEQO_DEBUG
 	if (bad > 0)
-		elog(DEBUG1, "%d invalid tours found while selecting %d pool entries",
-			 bad, pool->size);
+	{
+		elog(DEBUG1,
+			 "%d invalid tours found while selecting %d pool entries",
+			 bad,
+			 pool->size);
+	}
 #endif
 }
 
@@ -148,11 +169,17 @@ compare(const void *arg1, const void *arg2)
 	const Chromosome *chromo2 = (const Chromosome *) arg2;
 
 	if (chromo1->worth == chromo2->worth)
+	{
 		return 0;
+	}
 	else if (chromo1->worth > chromo2->worth)
+	{
 		return 1;
+	}
 	else
+	{
 		return -1;
+	}
 }
 
 /* alloc_chromo
@@ -196,7 +223,9 @@ spread_chromo(PlannerInfo *root, Chromosome *chromo, Pool *pool)
 
 	/* new chromo is so bad we can't use it */
 	if (chromo->worth > pool->data[pool->size - 1].worth)
+	{
 		return;
+	}
 
 	/* do a binary search to find the index of the new chromo */
 
@@ -210,14 +239,21 @@ spread_chromo(PlannerInfo *root, Chromosome *chromo, Pool *pool)
 		/* these 4 cases find a new location */
 
 		if (chromo->worth <= pool->data[top].worth)
+		{
 			index = top;
+		}
 		else if (chromo->worth == pool->data[mid].worth)
+		{
 			index = mid;
+		}
 		else if (chromo->worth == pool->data[bot].worth)
+		{
 			index = bot;
+		}
 		else if (bot - top <= 1)
+		{
 			index = bot;
-
+		}
 
 		/*
 		 * these 2 cases move the search indices since a new location has not
