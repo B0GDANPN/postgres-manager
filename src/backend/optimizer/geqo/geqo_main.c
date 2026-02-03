@@ -334,6 +334,7 @@ geqo(PlannerInfo *root, int number_of_rels, List *initial_rels, List *order_cand
 
 	/* ... clear root pointer to our private storage */
 	List	   *partials;
+
 	partials = private.partial_plans;
 	root->join_search_private = NULL;
 	if (best_rel)

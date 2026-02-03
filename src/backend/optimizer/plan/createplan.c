@@ -106,7 +106,7 @@ static Sort *create_sort_plan(PlannerInfo *root, SortPath *best_path, int flags)
 static IncrementalSort *create_incrementalsort_plan(PlannerInfo *root,
 													IncrementalSortPath *best_path, int flags);
 static Group *create_group_plan(PlannerInfo *root, GroupPath *best_path);
-static Unique *create_upper_unique_plan(PlannerInfo *root, UpperUniquePath *best_path,
+static Unique *create_upper_unique_plan(PlannerInfo *root, UpperUniquePath * best_path,
 										int flags);
 static Agg *create_agg_plan(PlannerInfo *root, AggPath *best_path);
 static Plan *create_groupingsets_plan(PlannerInfo *root, GroupingSetsPath *best_path);
@@ -2274,7 +2274,7 @@ create_group_plan(PlannerInfo *root, GroupPath *best_path)
  *	  for its subpaths.
  */
 static Unique *
-create_upper_unique_plan(PlannerInfo *root, UpperUniquePath *best_path, int flags)
+create_upper_unique_plan(PlannerInfo *root, UpperUniquePath * best_path, int flags)
 {
 	Unique	   *plan;
 	Plan	   *subplan;

@@ -3669,6 +3669,7 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels, C
 	int			lev;
 	RelOptInfo *rel;
 	List	   *result = NIL;
+
 	/*
 	 * This function cannot be invoked recursively within any one planning
 	 * problem, so join_rel_level[] can't be in use already.

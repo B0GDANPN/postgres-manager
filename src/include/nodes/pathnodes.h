@@ -624,7 +624,7 @@ typedef struct PartitionSchemeData
 
 	/* Cached information about partition comparison functions. */
 	struct FmgrInfo *partsupfunc;
-}			PartitionSchemeData;
+} PartitionSchemeData;
 
 typedef struct PartitionSchemeData *PartitionScheme;
 
@@ -2156,7 +2156,7 @@ typedef enum UniquePathMethod
 	UNIQUE_PATH_NOOP,			/* input is known unique already */
 	UNIQUE_PATH_HASH,			/* use hashing */
 	UNIQUE_PATH_SORT,			/* use sorting */
-} UniquePathMethod;
+}			UniquePathMethod;
 
 typedef struct UniquePath
 {
@@ -2383,7 +2383,7 @@ typedef struct UpperUniquePath
 	Path		path;
 	Path	   *subpath;		/* path representing input source */
 	int			numkeys;		/* number of pathkey columns to compare */
-} UpperUniquePath;
+}			UpperUniquePath;
 
 /*
  * AggPath represents generic computation of aggregate functions

@@ -79,7 +79,7 @@ typedef struct
 	int			nargs;
 	List	   *args;
 	int			sublevels_up;
-} substitute_actual_srf_parameters_context;
+}			substitute_actual_srf_parameters_context;
 
 typedef struct
 {
@@ -154,7 +154,7 @@ static void sql_inline_error_callback(void *arg);
 static Query *substitute_actual_srf_parameters(Query *expr,
 											   int nargs, List *args);
 static Node *substitute_actual_srf_parameters_mutator(Node *node,
-													  substitute_actual_srf_parameters_context *context);
+													  substitute_actual_srf_parameters_context * context);
 static bool pull_paramids_walker(Node *node, Bitmapset **context);
 
 
@@ -5373,7 +5373,7 @@ substitute_actual_srf_parameters(Query *expr, int nargs, List *args)
 
 static Node *
 substitute_actual_srf_parameters_mutator(Node *node,
-										 substitute_actual_srf_parameters_context *context)
+										 substitute_actual_srf_parameters_context * context)
 {
 	Node	   *result;
 

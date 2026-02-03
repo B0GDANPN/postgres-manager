@@ -88,6 +88,7 @@ join_search_one_level(PlannerInfo *root, int level, Cost budget, Cost *cost)
 		{
 			int			first_rel;
 			bool		result;
+
 			/*
 			 * There are join clauses or join order restrictions relevant to
 			 * this rel, so consider joins between this rel and (only) those
@@ -114,11 +115,11 @@ join_search_one_level(PlannerInfo *root, int level, Cost budget, Cost *cost)
 				return false;
 			}
 			result = make_rels_by_clause_joins(root,
-														   old_rel,
-														   joinrels[1],
-														   first_rel,
-														   budget,
-														   cost);
+											   old_rel,
+											   joinrels[1],
+											   first_rel,
+											   budget,
+											   cost);
 
 			if (!result)
 			{
@@ -140,15 +141,16 @@ join_search_one_level(PlannerInfo *root, int level, Cost budget, Cost *cost)
 			 * avoid the duplicated effort.
 			 */
 			bool		result;
+
 			if (*cost > budget)
 			{
 				return false;
 			}
 			result = make_rels_by_clauseless_joins(root,
-															   old_rel,
-															   joinrels[1],
-															   budget,
-															   cost);
+												   old_rel,
+												   joinrels[1],
+												   budget,
+												   cost);
 
 			if (!result)
 			{
@@ -219,6 +221,7 @@ join_search_one_level(PlannerInfo *root, int level, Cost budget, Cost *cost)
 						have_join_order_restriction(root, old_rel, new_rel))
 					{
 						Cost		tmp;
+
 						if (*cost > budget)
 						{
 							return false;
@@ -272,10 +275,10 @@ join_search_one_level(PlannerInfo *root, int level, Cost budget, Cost *cost)
 				return false;
 			}
 			result = make_rels_by_clauseless_joins(root,
-															   old_rel,
-															   joinrels[1],
-															   budget,
-															   cost);
+												   old_rel,
+												   joinrels[1],
+												   budget,
+												   cost);
 
 			if (!result)
 			{

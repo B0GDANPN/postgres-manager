@@ -160,8 +160,9 @@ gimme_tree(PlannerInfo *root, Gene *tour, int num_gene)
 	GeqoPrivateData *private = (GeqoPrivateData *) root->join_search_private;
 	List	   *clumps;
 	int			rel_count;
-	RelOptInfo *result=NULL;
+	RelOptInfo *result = NULL;
 	Cost		cost_result;
+
 	/*
 	 * Sometimes, a relation can't yet be joined to others due to heuristics
 	 * or actual semantic restrictions.  We maintain a list of "clumps" of

@@ -115,8 +115,8 @@ random_init_pool(PlannerInfo *root, Pool *pool, List *order_candidates)
 		}
 		else
 		{
-			//need get order from
-				int		   *order = (int *) lfirst(list_nth_cell(order_candidates, i));
+			/* need get order from */
+			int		   *order = (int *) lfirst(list_nth_cell(order_candidates, i));
 
 			memcpy(chromo[i].string, order, pool->string_length * sizeof(Gene));
 		}
