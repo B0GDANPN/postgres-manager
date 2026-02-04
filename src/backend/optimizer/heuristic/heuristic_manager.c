@@ -19,6 +19,7 @@ static const double q = 0.25;
 static const double budget_soft_limit = 0.9;
 static const double k1 = 0.5;
 static const double k2 = 0.5;
+static const double k3 = 0.5;
 typedef struct goo_fix_plan
 {
 	int		   *order;			/* array int[count_rel + 1] */
@@ -71,7 +72,7 @@ split_budget_among_topologies(List *topologies, Cost budget, ListCell *init_cell
 			continue;
 		}
 		k_sel = 1 / topology->sel;
-		sum_complexities += k1 * topology->ccp + k2 * k_sel;
+		sum_complexities += k1 * topology->ccp + k2 * k_sel + k3 * topology->vol;
 	}
 	for_each_from(lc, topologies, from)
 	{
@@ -346,7 +347,7 @@ choose_min_cost_cover(List *partial_plans)
  *and the GOO fallback.
  *
  * First, it tries to apply a specialized algorithm to the topology. If the
- *budget for this is insufficient, it switches (while preserving the results) to
+ *budget for this is insufficient, it switches to
  *dynamic programming. If the budget for dynamic programming is insufficient, it
  *uses a greedy approach.
  * @param root The planner context.
@@ -554,7 +555,7 @@ plan_chain_dp(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 }
 
 /**
- * @brief Plan a cycle by removing the most expensive edge and planning a chain.
+ * @brief Plan a cycle by removing the most cardinal edge and planning a chain.
  *
  * Converts the cycle into a chain by removing the edge with maximal estimated
  * cardinality, then tries to reattach the removed vertex within budget.
