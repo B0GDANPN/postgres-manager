@@ -138,18 +138,21 @@ heuristic_join_search(PlannerInfo *root, List *initial_rels, Cost budget)
 			ListCell   *lc2 = NULL;
 
 			update_indices(component);
+			print_topology(component);
 			used_vertexes =
 				(bool *) palloc0(list_length(comp_vertexes) * sizeof(bool));
-
-			dense_subgraphs =
-				find_dense_subgraphs(root, comp_vertexes, used_vertexes);
-			topologies = list_concat(topologies, dense_subgraphs);
-			cycles = find_cycles(root, comp_vertexes, used_vertexes);
-			topologies = list_concat(topologies, cycles);
 			stars = find_stars(root, comp_vertexes, used_vertexes);
 			topologies = list_concat(topologies, stars);
+
+			dense_subgraphs = find_dense_subgraphs(root, comp_vertexes, used_vertexes);
+			topologies = list_concat(topologies, dense_subgraphs);
+
+			cycles = find_cycles(root, comp_vertexes, used_vertexes);
+			topologies = list_concat(topologies, cycles);
+
 			remaining_chains = find_chains(root, comp_vertexes, used_vertexes);
 			topologies = list_concat(topologies, remaining_chains);
+
 			split_budget_among_topologies(topologies, current_budget, NULL);
 
 			foreach(lc2, topologies)
@@ -372,7 +375,7 @@ plan_subgraph(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 			partial_plans = plan_cycle(root, topology, &cost_tmp_plan);
 			break;
 		case STAR:
-			partial_plans = plan_star2(root, topology, &cost_tmp_plan);
+			partial_plans = plan_star(root, topology, &cost_tmp_plan);
 			break;
 		case DENSITY_GRAPH:
 			partial_plans = plan_dp_sub(root, topology, &cost_tmp_plan);
@@ -855,14 +858,14 @@ plan_star2(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 static List *
 plan_dp_sub(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 {
-	Vertex	  **best_plans = NULL;
+	RelOptInfo **best_plans = NULL;
 	Cost	   *best_costs = NULL;
 	List	   *partials = NIL;
 	RelOptInfo *best_plan = NULL;
 	int			n = list_length(topology->vertexes);
 	size_t		total_sets = ((size_t) 1) << n;
 
-	best_plans = (Vertex * *) palloc0(total_sets * sizeof(Vertex *));
+	best_plans = (RelOptInfo **) palloc0(total_sets * sizeof(RelOptInfo *));
 	best_costs = (Cost *) palloc0(total_sets * sizeof(Cost));
 	update_indices(topology);
 
@@ -877,17 +880,16 @@ plan_dp_sub(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 		ListCell   *lc_v = list_nth_cell(topology->vertexes, i);
 		Vertex	   *v = (Vertex *) lfirst(lc_v);
 
-		best_plans[mask] = v;
+		best_plans[mask] = v->rel;
 		partials = lappend(partials, v->rel);
-		best_costs[mask] = best_plans[mask]->rel->cheapest_total_path->total_cost;
+		best_costs[mask] = best_plans[mask]->cheapest_total_path->total_cost;
 	}
 
 	for (size_t join_bm = 1; join_bm < total_sets; join_bm++)
 	{
-		size_t		members = pg_popcount64(join_bm);
 		size_t		left_bm = (-join_bm) & join_bm;
 
-		if (members == 1)
+		if (pg_popcount64(join_bm) <= 1)
 		{
 			continue;
 		}
@@ -915,7 +917,7 @@ plan_dp_sub(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 				left_bm = (left_bm - join_bm) & join_bm;
 				continue;
 			}
-
+			/**
 			if (pg_popcount64(left_bm) > 1 &&
 				!is_connected(topology->vertexes, left_bm))
 			{
@@ -928,8 +930,9 @@ plan_dp_sub(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 				left_bm = (left_bm - join_bm) & join_bm;
 				continue;
 			}
-			left_plan = best_plans[left_bm]->rel;
-			right_plan = best_plans[right_bm]->rel;
+			*/
+			left_plan = best_plans[left_bm];
+			right_plan = best_plans[right_bm];
 			if (!has_edge(root, left_plan, right_plan))
 			{
 				left_bm = (left_bm - join_bm) & join_bm;
@@ -953,7 +956,7 @@ plan_dp_sub(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 			if (join->cheapest_total_path->total_cost < best_costs[join_bm])
 			{
 				best_costs[join_bm] = join->cheapest_total_path->total_cost;
-				best_plans[join_bm]->rel = join;
+				best_plans[join_bm] = join;
 			}
 			partials = lappend(partials, join);
 			left_bm = (left_bm - join_bm) & join_bm;

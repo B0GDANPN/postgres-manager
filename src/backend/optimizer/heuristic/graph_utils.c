@@ -22,7 +22,7 @@
 
 static const uint64 dphyp_geqo_cc_threshold = 10000;
 static const double THRESH = 0.9;
-static const Selectivity border_selectivity = 0.4;
+static const Selectivity border_selectivity = 0.2;
 static const int max_ray_length = 3;
 static const int min_length_cycle = 3;
 static void set_complexity_topology(PlannerInfo *root, Topology * topology);
@@ -86,8 +86,22 @@ print_graph(PlannerInfo *root, List *graph)
 		{
 			Vertex	   *neighbor = (Vertex *) lfirst(lc2);
 			Cost		prel_join_cost = cost_edge(root, vertex->rel, neighbor->rel);
+			Selectivity selectivity = get_selectivity(root, vertex->rel, neighbor->rel);
 
-			appendStringInfo(&buf, " %zu(%lf)", neighbor->index, prel_join_cost);
+			appendStringInfo(&buf, " %zu(%.3lf, %.9lf)", neighbor->index, prel_join_cost, selectivity);
+		}
+		appendStringInfo(&buf, "\n");
+	}
+	appendStringInfo(&buf, "\n");
+	foreach(lc, graph)
+	{
+		Vertex	   *v = (Vertex *) lfirst(lc);
+		int			i = -1;
+
+		appendStringInfo(&buf, "bitmap v_%zu: ", v->index);
+		while ((i = bms_next_member(v->rel->relids, i)) >= 0)
+		{
+			appendStringInfo(&buf, "%d ", i);
 		}
 		appendStringInfo(&buf, "\n");
 	}
@@ -494,6 +508,7 @@ find_cycles(PlannerInfo *root, List *vertexes, bool *used_vertexes_comp)
 		set_vol_topology(root, topology);
 		set_complexity_topology(root, topology);
 		cyclic_topologies = lappend(cyclic_topologies, topology);
+		/* print_topology(topology); */
 	}
 	pfree(visited);
 	return cyclic_topologies;
@@ -562,6 +577,10 @@ find_star(PlannerInfo *root, Vertex * center, bool *used_vertexes,
 		Vertex	   *curr = (Vertex *) lfirst(lc);
 		List	   *chain = NIL;
 
+		if (used_vertexes[curr->index])
+		{
+			continue;
+		}
 		while (ray_len < max_ray_length)
 		{
 			Selectivity sel;
@@ -678,6 +697,7 @@ find_stars(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 		set_vol_topology(root, topology);
 		set_complexity_topology(root, topology);
 		stars = lappend(stars, topology);
+		/* print_topology(topology); */
 	}
 	return stars;
 }
@@ -865,7 +885,7 @@ find_dense_subgraphs(PlannerInfo *root, List *vertexes, bool *used)
 		set_vol_topology(root, topology);
 		set_complexity_topology(root, topology);
 		dense_sets = lappend(dense_sets, topology);
-
+		/* print_topology(topology); */
 		foreach(lc, candidate)
 		{
 			Vertex	   *v = (Vertex *) lfirst(lc);
