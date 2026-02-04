@@ -25,7 +25,7 @@ typedef struct goo_fix_plan
 	RelOptInfo *plan;
 }			goo_fix_plan;
 static List *choose_min_cost_cover(List *partial_plans);
-static RelOptInfo *plan_subgraph(PlannerInfo *root, Topology * topology, Cost *cost_plan);
+static RelOptInfo *plan_topology(PlannerInfo *root, Topology * topology, Cost *cost_plan);
 
 static List *goo(PlannerInfo *root, List *initial_rels, Cost budget, Cost *cost_plan,
 				 bool clauseless, bool force);
@@ -159,7 +159,9 @@ heuristic_join_search(PlannerInfo *root, List *initial_rels, Cost budget)
 			{
 				Topology   *topology = (Topology *) lfirst(lc2);
 				Cost		cost_plan = 0;
-				RelOptInfo *plan = plan_subgraph(root, topology, &cost_plan);
+				RelOptInfo *plan = plan_topology(root, topology, &cost_plan);
+
+				print_trace(plan);
 
 				topology_plans = lappend(topology_plans, plan);
 				current_budget -= cost_plan;
@@ -356,7 +358,7 @@ choose_min_cost_cover(List *partial_plans)
  *plans.
  **/
 static RelOptInfo *
-plan_subgraph(PlannerInfo *root, Topology * topology, Cost *cost_plan)
+plan_topology(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 {
 	RelOptInfo *plan = NULL;
 	List	   *partial_plans = NIL;

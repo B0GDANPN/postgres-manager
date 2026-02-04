@@ -1212,3 +1212,15 @@ cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 
 	return min_cost;
 }
+
+void
+print_trace(RelOptInfo *rel)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "\n----------------------PRINT_TRACE\n");
+	appendStringInfo(&buf, "%s\n", rel->trace);
+	ereport(NOTICE, (errmsg("%s\n", buf.data)));
+	pfree(buf.data);
+}
