@@ -4,6 +4,6 @@
 #include "postgres.h"
 
 #include "nodes/pathnodes.h"
-extern RelOptInfo *heuristic_join_search(PlannerInfo *root, List *initial_rels, Cost budget);
+extern RelOptInfo *heuristic_join_search(PlannerInfo *root, List *initial_rels);
 
 #endif

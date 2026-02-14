@@ -25,9 +25,8 @@
 #include "utils/memutils.h"
 
 static bool make_rels_by_clause_joins(PlannerInfo *root, RelOptInfo *old_rel, List *other_rels,
-									  int first_rel_idx, Cost budget, Cost *cost);
-static bool make_rels_by_clauseless_joins(PlannerInfo *root, RelOptInfo *old_rel, List *other_rels,
-										  Cost budget, Cost *cost);
+									  int first_rel_idx);
+static bool make_rels_by_clauseless_joins(PlannerInfo *root, RelOptInfo *old_rel, List *other_rels);
 static bool has_join_restriction(PlannerInfo *root, RelOptInfo *rel);
 static bool has_legal_joinclause(PlannerInfo *root, RelOptInfo *rel);
 static bool restriction_is_constant_false(List *restrictlist, RelOptInfo *joinrel,
@@ -61,7 +60,7 @@ static void get_matching_part_pairs(PlannerInfo *root, RelOptInfo *joinrel, RelO
  * The result is returned in root->join_rel_level[level].
  */
 bool
-join_search_one_level(PlannerInfo *root, int level, Cost budget, Cost *cost)
+join_search_one_level(PlannerInfo *root, int level)
 {
 	List	  **joinrels = root->join_rel_level;
 	ListCell   *r;
@@ -110,16 +109,14 @@ join_search_one_level(PlannerInfo *root, int level, Cost budget, Cost *cost)
 			{
 				first_rel = 0;
 			}
-			if (*cost > budget)
+			if (root->spent_budget > root->topology_budget)
 			{
 				return false;
 			}
 			result = make_rels_by_clause_joins(root,
 											   old_rel,
 											   joinrels[1],
-											   first_rel,
-											   budget,
-											   cost);
+											   first_rel);
 
 			if (!result)
 			{
@@ -142,15 +139,13 @@ join_search_one_level(PlannerInfo *root, int level, Cost budget, Cost *cost)
 			 */
 			bool		result;
 
-			if (*cost > budget)
+			if (root->spent_budget > root->topology_budget)
 			{
 				return false;
 			}
 			result = make_rels_by_clauseless_joins(root,
 												   old_rel,
-												   joinrels[1],
-												   budget,
-												   cost);
+												   joinrels[1]);
 
 			if (!result)
 			{
@@ -222,18 +217,18 @@ join_search_one_level(PlannerInfo *root, int level, Cost budget, Cost *cost)
 					{
 						Cost		tmp;
 
-						if (*cost > budget)
+						if (root->spent_budget > root->topology_budget)
 						{
 							return false;
 						}
 						tmp = cost_edge(root, old_rel, new_rel);
 
-						if (*cost + tmp > budget)
+						if (root->spent_budget + tmp > root->topology_budget)
 						{
 							return false;
 						}
 						(void) make_join_rel(root, old_rel, new_rel);
-						*cost += tmp;
+						root->spent_budget += tmp;
 					}
 				}
 			}
@@ -270,15 +265,13 @@ join_search_one_level(PlannerInfo *root, int level, Cost budget, Cost *cost)
 			bool		result;
 			RelOptInfo *old_rel = (RelOptInfo *) lfirst(r);
 
-			if (*cost > budget)
+			if (root->spent_budget > root->topology_budget)
 			{
 				return false;
 			}
 			result = make_rels_by_clauseless_joins(root,
 												   old_rel,
-												   joinrels[1],
-												   budget,
-												   cost);
+												   joinrels[1]);
 
 			if (!result)
 			{
@@ -335,7 +328,7 @@ join_search_one_level(PlannerInfo *root, int level, Cost budget, Cost *cost)
  */
 static bool
 make_rels_by_clause_joins(PlannerInfo *root, RelOptInfo *old_rel, List *other_rels,
-						  int first_rel_idx, Cost budget, Cost *cost)
+						  int first_rel_idx)
 {
 	ListCell   *l;
 
@@ -349,12 +342,12 @@ make_rels_by_clause_joins(PlannerInfo *root, RelOptInfo *old_rel, List *other_re
 		{
 			Cost		tmp = cost_edge(root, old_rel, other_rel);
 
-			if (*cost + tmp > budget)
+			if (root->spent_budget > root->topology_budget)
 			{
 				return false;
 			}
 			(void) make_join_rel(root, old_rel, other_rel);
-			*cost += tmp;
+			root->spent_budget += tmp;
 		}
 	}
 
@@ -375,8 +368,7 @@ make_rels_by_clause_joins(PlannerInfo *root, RelOptInfo *old_rel, List *other_re
  * work for joining to joinrels too.
  */
 static bool
-make_rels_by_clauseless_joins(PlannerInfo *root, RelOptInfo *old_rel, List *other_rels,
-							  Cost budget, Cost *cost)
+make_rels_by_clauseless_joins(PlannerInfo *root, RelOptInfo *old_rel, List *other_rels)
 {
 	ListCell   *l;
 
@@ -388,12 +380,12 @@ make_rels_by_clauseless_joins(PlannerInfo *root, RelOptInfo *old_rel, List *othe
 		{
 			Cost		tmp = cost_edge(root, old_rel, other_rel);
 
-			if (*cost + tmp > budget)
+			if (root->spent_budget + tmp > root->topology_budget)
 			{
 				return false;
 			}
 			(void) make_join_rel(root, old_rel, other_rel);
-			*cost += tmp;
+			root->spent_budget += tmp;
 		}
 	}
 	return true;

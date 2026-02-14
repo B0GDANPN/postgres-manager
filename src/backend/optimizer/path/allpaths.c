@@ -3620,7 +3620,7 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		 * has_legal_joinclause() needs to look at it (ugly :-().
 		 */
 		root->initial_rels = initial_rels;
-		return heuristic_join_search(root, initial_rels, levels_needed * 100);
+		return heuristic_join_search(root, initial_rels);
 		/* return geqo(root, levels_needed, initial_rels, NIL); */
 
 		/*
@@ -3663,8 +3663,7 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
  * original states of those data structures.  See geqo_eval() for an example.
  */
 List *
-standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels, Cost budget,
-					 Cost *cost)
+standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 {
 	int			lev;
 	RelOptInfo *rel;
@@ -3700,7 +3699,7 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels, C
 		 * level, and build paths for making each one from every available
 		 * pair of lower-level relations.
 		 */
-		bool		done = join_search_one_level(root, lev, budget, cost);
+		bool		done = join_search_one_level(root, lev);
 
 		/*
 		 * Run generate_partitionwise_join_paths() and

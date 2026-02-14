@@ -60,8 +60,7 @@ static int	gimme_number_generations(int pool_size);
  */
 
 List *
-geqo(PlannerInfo *root, int number_of_rels, List *initial_rels, List *order_candidates,
-	 Cost budget, Cost *cost_plan)
+geqo(PlannerInfo *root, int number_of_rels, List *initial_rels, List *order_candidates)
 {
 	GeqoPrivateData private;
 	int			generation;
@@ -71,7 +70,7 @@ geqo(PlannerInfo *root, int number_of_rels, List *initial_rels, List *order_cand
 	Pool	   *pool;
 	int			pool_size,
 				number_generations;
-
+	List	   *partials = NULL;
 #ifdef GEQO_DEBUG
 	int			status_interval;
 #endif
@@ -93,8 +92,8 @@ geqo(PlannerInfo *root, int number_of_rels, List *initial_rels, List *order_cand
 	/* set up private information */
 	root->join_search_private = &private;
 	private.initial_rels = initial_rels;
-	private.budget = budget;
-	private.cost_plan = cost_plan;
+	private.budget = root->topology_budget;
+	private.cost_plan = root->spent_budget;
 	private.partial_plans = NIL;
 
 	/* initialize private number generator */
@@ -333,8 +332,6 @@ geqo(PlannerInfo *root, int number_of_rels, List *initial_rels, List *order_cand
 	free_pool(root, pool);
 
 	/* ... clear root pointer to our private storage */
-	List	   *partials;
-
 	partials = private.partial_plans;
 	root->join_search_private = NULL;
 	if (best_rel)

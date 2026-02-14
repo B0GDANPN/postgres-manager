@@ -219,12 +219,12 @@ gimme_tree(PlannerInfo *root, Gene *tour, int num_gene)
 	result = ((Clump *) linitial(clumps))->joinrel;
 	cost_result = result->cheapest_total_path->total_cost;
 
-	if (*private->cost_plan + cost_result > private->budget)
+	if (private->cost_plan + cost_result > private->budget)
 	{
 		return NULL;
 	}
 
-	*private->cost_plan += cost_result;
+	private->cost_plan += cost_result;
 	private->partial_plans = lappend(private->partial_plans, result);
 	return result;
 }

@@ -26,18 +26,18 @@ typedef struct goo_fix_plan
 	RelOptInfo *plan;
 }			goo_fix_plan;
 static List *choose_min_cost_cover(List *partial_plans);
-static RelOptInfo *plan_topology(PlannerInfo *root, Topology * topology, Cost *cost_plan);
+static RelOptInfo *plan_topology(PlannerInfo *root, Topology * topology);
 
-static List *goo(PlannerInfo *root, List *initial_rels, Cost budget, Cost *cost_plan,
+static List *goo(PlannerInfo *root, List *initial_rels,
 				 bool clauseless, bool force);
-static goo_fix_plan * goo_fixed(PlannerInfo *root, List *initial_rels, ListCell *fixed, Cost budget,
-								Cost *cost_plan, bool clauseless, bool force);
-static List *plan_chain_dp(PlannerInfo *root, Topology * topology, Cost *cost_plan);
-static List *plan_cycle(PlannerInfo *root, Topology * topology, Cost *cost_plan);
-static List *plan_star(PlannerInfo *root, Topology * topology, Cost *cost_plan);
-static List *plan_star2(PlannerInfo *root, Topology * topology, Cost *cost_plan);
-static List *plan_dp_sub(PlannerInfo *root, Topology * topology, Cost *cost_plan);
-static List *plan_geqo_goo(PlannerInfo *root, Topology * topology, Cost *cost_plan);
+static goo_fix_plan * goo_fixed(PlannerInfo *root, List *initial_rels, ListCell *fixed,
+								bool clauseless, bool force);
+static List *plan_chain_dp(PlannerInfo *root, Topology * topology);
+static List *plan_cycle(PlannerInfo *root, Topology * topology);
+static List *plan_star(PlannerInfo *root, Topology * topology);
+static List *plan_star2(PlannerInfo *root, Topology * topology);
+static List *plan_dp_sub(PlannerInfo *root, Topology * topology);
+static List *plan_geqo_goo(PlannerInfo *root, Topology * topology);
 static void split_budget_among_topologies(List *topologies, Cost budget, ListCell *init_cell);
 
 /**
@@ -99,19 +99,22 @@ split_budget_among_topologies(List *topologies, Cost budget, ListCell *init_cell
  * @return Final join plan for all relations.
  */
 RelOptInfo *
-heuristic_join_search(PlannerInfo *root, List *initial_rels, Cost budget)
+heuristic_join_search(PlannerInfo *root, List *initial_rels)
 {
 	List	   *graph = build_join_graph(root, initial_rels);	/* List* of Vertex* */
 	List	   *components = split_components(root, graph); /* list of
 															 * Topology(COMPONENT)* */
 	List	   *component_plans = NIL;
 	ListCell   *lc = NULL;
-	Cost		cost_plan;
 	List	   *partial_plans = NULL;
 	RelOptInfo *final_plan = NULL;
 
-	split_budget_among_topologies(components, budget, NULL);
 	root->last_topology_id = 0;
+	root->global_budget = 0;
+	root->topology_budget = 0;
+	root->spent_budget = 0;
+	root->global_budget = DBL_MAX;	/* DEBUG */
+	split_budget_among_topologies(components, root->global_budget, NULL);
 	foreach(lc, components)
 	{
 		Topology   *component = (Topology *) lfirst(lc);
@@ -121,7 +124,7 @@ heuristic_join_search(PlannerInfo *root, List *initial_rels, Cost budget)
 		Cost		component_budget;
 		Cost		current_budget;
 
-		split_budget_among_topologies(components, budget, lc);
+		split_budget_among_topologies(components, root->global_budget, lc);
 
 		comp_vertexes = component->vertexes;	/* List* of Vertex*  */
 
@@ -159,13 +162,16 @@ heuristic_join_search(PlannerInfo *root, List *initial_rels, Cost budget)
 			foreach(lc2, topologies)
 			{
 				Topology   *topology = (Topology *) lfirst(lc2);
-				Cost		cost_plan = 0;
-				RelOptInfo *plan = plan_topology(root, topology, &cost_plan);
+				RelOptInfo *plan;
+
+				root->spent_budget = 0;
+				root->topology_budget = topology->budget;
+				plan = plan_topology(root, topology);
 
 				print_trace(plan);
 
 				topology_plans = lappend(topology_plans, plan);
-				current_budget -= cost_plan;
+				current_budget -= root->spent_budget;
 			}
 			component_budget += current_budget; /* maybe remain budget */
 			current_budget = component_budget * q;
@@ -176,14 +182,15 @@ heuristic_join_search(PlannerInfo *root, List *initial_rels, Cost budget)
 		v = (Vertex *) linitial(comp_vertexes);
 		comp_plan = v->rel;
 		component_plans = lappend(component_plans, comp_plan);
-		budget -= (component->budget - component_budget);
+		root->global_budget -= (component->budget - component_budget);
 	}
-	cost_plan = 0;
-	partial_plans = goo(root, component_plans, budget, &cost_plan, true, true);
+	root->spent_budget = 0;
+	root->topology_budget = root->global_budget;
+	partial_plans = goo(root, component_plans, true, true);
 	final_plan = (RelOptInfo *) linitial(partial_plans);
-	if (budget >= cost_plan)
+	if (root->global_budget >= root->spent_budget)
 	{
-		budget -= cost_plan;
+		root->global_budget -= root->spent_budget;
 	}
 	list_free(component_plans);
 	list_free(components);
@@ -204,7 +211,7 @@ heuristic_join_search(PlannerInfo *root, List *initial_rels, Cost budget)
  * @return Final join plan.
  */
 static List *
-goo(PlannerInfo *root, List *initial_rels, Cost budget, Cost *cost_plan,
+goo(PlannerInfo *root, List *initial_rels,
 	bool clauseless, bool force)
 {
 	while (list_length(initial_rels) > 1)
@@ -237,8 +244,8 @@ goo(PlannerInfo *root, List *initial_rels, Cost budget, Cost *cost_plan,
 				{
 					Cost		prel_join_cost = cost_edge(root, rel1, rel2);
 
-					if (!force && (*cost_plan + prel_join_cost >
-								   budget * budget_soft_limit))
+					if (!force && (root->spent_budget + prel_join_cost >
+								   root->topology_budget * budget_soft_limit))
 					{
 						return initial_rels;
 					}
@@ -255,7 +262,7 @@ goo(PlannerInfo *root, List *initial_rels, Cost budget, Cost *cost_plan,
 		best_rel2 = (RelOptInfo *) lfirst(best_lc2);
 		best_rel = make_join_rel(root, best_rel1, best_rel2);
 		set_cheapest(best_rel);
-		*cost_plan += best_rel->cheapest_total_path->total_cost;
+		root->spent_budget += best_rel->cheapest_total_path->total_cost;
 		first = list_cell_number(initial_rels, best_lc1);
 		second = list_cell_number(initial_rels, best_lc2);
 		initial_rels = lappend(initial_rels, best_rel);
@@ -359,38 +366,38 @@ choose_min_cost_cover(List *partial_plans)
  *plans.
  **/
 static RelOptInfo *
-plan_topology(PlannerInfo *root, Topology * topology, Cost *cost_plan)
+plan_topology(PlannerInfo *root, Topology * topology)
 {
 	RelOptInfo *plan = NULL;
 	List	   *partial_plans = NIL;
-	Cost		cost_tmp_plan = 0;
 	List	   *initial_rels = NIL;
 	List	   *saved_rels = NIL;
+	Cost		spent_plan = 0;
 
-	topology->budget = DBL_MAX; /* debug */
+	root->topology_budget = DBL_MAX;	/* debug */
 	print_topology(topology);
 	switch (topology->form)
 	{
 		case CHAIN:
-			partial_plans = plan_chain_dp(root, topology, &cost_tmp_plan);
+			partial_plans = plan_chain_dp(root, topology);
 			break;
 		case CYCLE:
-			partial_plans = plan_cycle(root, topology, &cost_tmp_plan);
+			partial_plans = plan_cycle(root, topology);
 			break;
 		case STAR:
-			partial_plans = plan_star(root, topology, &cost_tmp_plan);
+			partial_plans = plan_star(root, topology);
 			break;
 		case DENSITY_GRAPH:
-			partial_plans = plan_dp_sub(root, topology, &cost_tmp_plan);
+			partial_plans = plan_dp_sub(root, topology);
 			break;
 		case COMPONENT:
 			break;
 	}
-	topology->budget -= cost_tmp_plan;
-	*cost_plan += cost_tmp_plan;
-	cost_tmp_plan = 0;
+	spent_plan += root->spent_budget;
+	root->topology_budget -= root->spent_budget;
 	if (list_length(partial_plans) == 1)
 	{
+		root->spent_budget += spent_plan;
 		plan = (RelOptInfo *) linitial(partial_plans);
 		return plan;
 	}
@@ -399,31 +406,30 @@ plan_topology(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 	initial_rels = choose_min_cost_cover(partial_plans);
 	saved_rels = root->initial_rels;
 	root->initial_rels = initial_rels;
+	root->spent_budget = 0;
 	partial_plans = standard_join_search(root,
 										 list_length(initial_rels),
-										 initial_rels,
-										 topology->budget,
-										 &cost_tmp_plan);
+										 initial_rels);
 	root->initial_rels = saved_rels;
-
-	topology->budget -= cost_tmp_plan;
-	*cost_plan += cost_tmp_plan;
-	cost_tmp_plan = 0;
+	spent_plan += root->spent_budget;
+	root->topology_budget -= root->spent_budget;
 	if (list_length(partial_plans) == 1)
 	{
+		root->spent_budget += spent_plan;
 		plan = (RelOptInfo *) linitial(partial_plans);
 		return plan;
 	}
 
 	/* specialized heuristis very expensive, so GOO. */
 	initial_rels = choose_min_cost_cover(partial_plans);
-	partial_plans = goo(root, initial_rels, topology->budget, &cost_tmp_plan, false, true);
+	root->spent_budget = 0;
+	partial_plans = goo(root, initial_rels, false, true);
 	plan = (RelOptInfo *) linitial(partial_plans);
-	if (topology->budget >= cost_tmp_plan)
+	if (root->topology_budget >= root->spent_budget)
 	{
-		topology->budget -= cost_tmp_plan;
+		root->topology_budget -= root->spent_budget;
 	}
-	*cost_plan += cost_tmp_plan;
+	root->spent_budget += spent_plan;
 	return plan;
 }
 
@@ -440,7 +446,7 @@ plan_topology(PlannerInfo *root, Topology * topology, Cost *cost_plan)
  * @return Single full plan or list of partial plans.
  */
 static List *
-plan_chain_dp(PlannerInfo *root, Topology * topology, Cost *cost_plan)
+plan_chain_dp(PlannerInfo *root, Topology * topology)
 {
 	int			n = list_length(topology->vertexes);
 	int			i,
@@ -488,8 +494,8 @@ plan_chain_dp(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 					continue;
 				}
 				prel_join_cost = cost_edge(root, dp[i][k], dp[k + 1][j]);
-				if (*cost_plan + prel_join_cost >
-					topology->budget * budget_soft_limit)
+				if (root->spent_budget + prel_join_cost >
+					root->topology_budget * budget_soft_limit)
 				{
 					success = false;
 					break;
@@ -506,7 +512,7 @@ plan_chain_dp(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 				}
 
 				join_cost = join->cheapest_total_path->total_cost;
-				*cost_plan += join_cost;
+				root->spent_budget += join_cost;
 				if (dp[i][j] == NULL ||
 					join_cost < dp[i][j]->cheapest_total_path->total_cost)
 				{
@@ -567,7 +573,7 @@ plan_chain_dp(PlannerInfo *root, Topology * topology, Cost *cost_plan)
  * @return Single full plan or list of partial plans.
  */
 static List *
-plan_cycle(PlannerInfo *root, Topology * topology, Cost *cost_plan)
+plan_cycle(PlannerInfo *root, Topology * topology)
 {
 	int			n = list_length(topology->vertexes);
 	List	   *chain_vertexes = NIL;
@@ -605,14 +611,14 @@ plan_cycle(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 	chain_topology->budget = topology->budget;
 	chain_topology->form = CHAIN;
 	v_removed = (Vertex *) lfirst(list_nth_cell(topology->vertexes, removed_idx));
-	chain_plans = plan_chain_dp(root, chain_topology, cost_plan);
+	chain_plans = plan_chain_dp(root, chain_topology);
 	if (list_length(chain_plans) == 1)
 	{
 		RelOptInfo *chain_plan = (RelOptInfo *) linitial(chain_plans);
 		RelOptInfo *removed_rel = v_removed->rel;
 		Cost		tmp = cost_edge(root, chain_plan, removed_rel);
 
-		if (*cost_plan + tmp <= topology->budget * budget_soft_limit)
+		if (root->spent_budget + tmp <= root->topology_budget * budget_soft_limit)
 		{
 			RelOptInfo *join = make_join_rel(root, chain_plan, removed_rel);
 
@@ -623,10 +629,10 @@ plan_cycle(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 				{
 					Cost		join_cost = join->cheapest_total_path->total_cost;
 
-					if (*cost_plan + join_cost <=
-						topology->budget * budget_soft_limit)
+					if (root->spent_budget + join_cost <=
+						root->topology_budget * budget_soft_limit)
 					{
-						*cost_plan += join_cost;
+						root->spent_budget += join_cost;
 						return list_make1(join);
 					}
 				}
@@ -649,7 +655,7 @@ plan_cycle(PlannerInfo *root, Topology * topology, Cost *cost_plan)
  * @return Single full plan or list of partial plans.
  */
 static List *
-plan_star(PlannerInfo *root, Topology * topology, Cost *cost_plan)
+plan_star(PlannerInfo *root, Topology * topology)
 {
 	Vertex	   *center_vertex = (Vertex *) linitial(topology->vertexes);
 	RelOptInfo *center_rel = center_vertex->rel;
@@ -700,7 +706,7 @@ plan_star(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 			RelOptInfo *rel = v_rel->rel;
 			Cost		prel_join_cost = cost_edge(root, center_rel, rel);
 
-			if (*cost_plan + prel_join_cost <= topology->budget * budget_soft_limit)
+			if (root->spent_budget + prel_join_cost <= root->topology_budget * budget_soft_limit)
 			{
 				RelOptInfo *new_center = NULL;
 				Cost		join_cost;
@@ -710,7 +716,7 @@ plan_star(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 				set_cheapest(new_center);
 				ind_array[best_ind_ray]++;
 				join_cost = new_center->cheapest_total_path->total_cost;
-				*cost_plan += join_cost;
+				root->spent_budget += join_cost;
 				center_rel = new_center;
 			}
 		}
@@ -753,7 +759,7 @@ plan_star(PlannerInfo *root, Topology * topology, Cost *cost_plan)
  * @return Single full plan or list of partial plans.
  */
 static List *
-plan_star2(PlannerInfo *root, Topology * topology, Cost *cost_plan)
+plan_star2(PlannerInfo *root, Topology * topology)
 {
 	Vertex	   *center_vertex = (Vertex *) linitial(topology->vertexes);
 	RelOptInfo *center_rel = center_vertex->rel;
@@ -775,7 +781,7 @@ plan_star2(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 		chain_topology.vertexes = ray_vertices;
 		chain_topology.form = CHAIN;
 		chain_topology.budget = topology->budget;
-		chain_plans = plan_chain_dp(root, &chain_topology, cost_plan);
+		chain_plans = plan_chain_dp(root, &chain_topology);
 		if (list_length(chain_plans) > 1)
 		{
 			ListCell   *lc2 = NULL;
@@ -823,7 +829,7 @@ plan_star2(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 			}
 		}
 
-		if (*cost_plan + best_edge_cost > topology->budget * budget_soft_limit)
+		if (root->spent_budget + best_edge_cost > root->topology_budget * budget_soft_limit)
 		{
 			partials = lappend(partials, center_rel);
 			lc = NULL;
@@ -839,7 +845,7 @@ plan_star2(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 		join = make_join_rel(root, center_rel, best_rel);
 		set_cheapest(join);
 		join_cost = join->cheapest_total_path->total_cost;
-		*cost_plan += join_cost;
+		root->spent_budget += join_cost;
 		center_rel = join;
 		chains_plans = list_delete_cell(chains_plans, best_cell);
 	}
@@ -859,7 +865,7 @@ plan_star2(PlannerInfo *root, Topology * topology, Cost *cost_plan)
  * @return Single full plan or list containing the best plan found.
  */
 static List *
-plan_dp_sub(PlannerInfo *root, Topology * topology, Cost *cost_plan)
+plan_dp_sub(PlannerInfo *root, Topology * topology)
 {
 	RelOptInfo **best_plans = NULL;
 	Cost	   *best_costs = NULL;
@@ -943,7 +949,7 @@ plan_dp_sub(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 			}
 
 			prel_join_cost = cost_edge(root, left_plan, right_plan);
-			if (*cost_plan + prel_join_cost > topology->budget * budget_soft_limit)
+			if (root->spent_budget + prel_join_cost > root->topology_budget * budget_soft_limit)
 			{
 				return partials;
 			}
@@ -955,7 +961,7 @@ plan_dp_sub(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 			}
 			set_cheapest(join);
 			join_cost = join->cheapest_total_path->total_cost;
-			*cost_plan += join_cost;
+			root->spent_budget += join_cost;
 			if (join->cheapest_total_path->total_cost < best_costs[join_bm])
 			{
 				best_costs[join_bm] = join->cheapest_total_path->total_cost;
@@ -971,8 +977,7 @@ plan_dp_sub(PlannerInfo *root, Topology * topology, Cost *cost_plan)
 	return list_make1(best_plan);
 }
 
-static goo_fix_plan * goo_fixed(PlannerInfo *root, List *initial_rels, ListCell *fixed, Cost budget,
-								Cost *cost_plan, bool clauseless, bool force)
+static goo_fix_plan * goo_fixed(PlannerInfo *root, List *initial_rels, ListCell *fixed, bool clauseless, bool force)
 {
 	goo_fix_plan *result = NULL;
 	int			n = list_length(initial_rels);
@@ -1008,7 +1013,7 @@ static goo_fix_plan * goo_fixed(PlannerInfo *root, List *initial_rels, ListCell 
 				Cost		prel_join_cost = cost_edge(root, rel1, rel2);
 
 				if (!force &&
-					(*cost_plan + prel_join_cost > budget * budget_soft_limit))
+					(root->spent_budget + prel_join_cost > root->topology_budget * budget_soft_limit))
 				{
 					pfree(order);
 					pfree(result);
@@ -1024,7 +1029,7 @@ static goo_fix_plan * goo_fixed(PlannerInfo *root, List *initial_rels, ListCell 
 		best_rel2 = (RelOptInfo *) lfirst(best_lc2);
 		best_rel = make_join_rel(root, rel1, best_rel2);
 		set_cheapest(best_rel);
-		*cost_plan += best_rel->cheapest_total_path->total_cost;
+		root->spent_budget += best_rel->cheapest_total_path->total_cost;
 		order[ind++] = bms_singleton_member(best_rel->relids);
 		left = list_cell_number(initial_rels, fixed);
 		right = list_cell_number(initial_rels, best_lc2);
@@ -1042,8 +1047,8 @@ static goo_fix_plan * goo_fixed(PlannerInfo *root, List *initial_rels, ListCell 
 	return result;
 }
 static List *
-plan_geqo_goo(PlannerInfo *root, Topology * topology,
-			  Cost *cost_plan)	/* only if each rel is baserel */
+plan_geqo_goo(PlannerInfo *root, Topology * topology)		/* only if each rel is
+															 * baserel */
 {
 	List	   *candidates = NIL;	/* List* of goo_fix_plans  */
 	List	   *initial_plans = NIL;
@@ -1063,8 +1068,6 @@ plan_geqo_goo(PlannerInfo *root, Topology * topology,
 		goo_fix_plan *candidate = goo_fixed(root,
 											copy_initial_plans,
 											lc,
-											topology->budget,
-											cost_plan,
 											false,
 											false);
 
@@ -1096,8 +1099,6 @@ plan_geqo_goo(PlannerInfo *root, Topology * topology,
 	partials = geqo(root,
 					list_length(initial_plans),
 					initial_plans,
-					candidates,
-					topology->budget,
-					cost_plan);
+					candidates);
 	return partials;
 }

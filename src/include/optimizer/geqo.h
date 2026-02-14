@@ -76,13 +76,12 @@ typedef struct
 	List	   *initial_rels;	/* the base relations we are joining */
 	pg_prng_state random_state; /* PRNG state */
 	Cost		budget;
-	Cost	   *cost_plan;
+	Cost	   cost_plan;
 	List	   *partial_plans;
 } GeqoPrivateData;
 
 /* routines in geqo_main.c */
-extern List *geqo(PlannerInfo *root, int number_of_rels, List *initial_rels, List *order_candidates,
-				  Cost budget, Cost *cost_plan);
+extern List *geqo(PlannerInfo *root, int number_of_rels, List *initial_rels, List *order_candidates);
 
 /* routines in geqo_eval.c */
 extern Cost geqo_eval(PlannerInfo *root, Gene *tour, int num_gene);
