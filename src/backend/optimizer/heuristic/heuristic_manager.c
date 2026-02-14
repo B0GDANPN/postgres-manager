@@ -30,14 +30,16 @@ static RelOptInfo *plan_topology(PlannerInfo *root, Topology * topology);
 
 static List *goo(PlannerInfo *root, List *initial_rels,
 				 bool clauseless, bool force);
-static goo_fix_plan * goo_fixed(PlannerInfo *root, List *initial_rels, ListCell *fixed,
-								bool clauseless, bool force);
+
+/*static goo_fix_plan * goo_fixed(PlannerInfo *root, List *initial_rels, ListCell *fixed,
+								bool clauseless, bool force);*/
 static List *plan_chain_dp(PlannerInfo *root, Topology * topology);
 static List *plan_cycle(PlannerInfo *root, Topology * topology);
 static List *plan_star(PlannerInfo *root, Topology * topology);
 static List *plan_star2(PlannerInfo *root, Topology * topology);
 static List *plan_dp_sub(PlannerInfo *root, Topology * topology);
-static List *plan_geqo_goo(PlannerInfo *root, Topology * topology);
+
+/*static List *plan_geqo_goo(PlannerInfo *root, Topology * topology);*/
 static void split_budget_among_topologies(List *topologies, Cost budget, ListCell *init_cell);
 
 /**
@@ -977,6 +979,7 @@ plan_dp_sub(PlannerInfo *root, Topology * topology)
 	return list_make1(best_plan);
 }
 
+/*
 static goo_fix_plan * goo_fixed(PlannerInfo *root, List *initial_rels, ListCell *fixed, bool clauseless, bool force)
 {
 	goo_fix_plan *result = NULL;
@@ -1046,11 +1049,13 @@ static goo_fix_plan * goo_fixed(PlannerInfo *root, List *initial_rels, ListCell 
 	result->order = order;
 	return result;
 }
+*/
+
+
+/*
 static List *
-plan_geqo_goo(PlannerInfo *root, Topology * topology)		/* only if each rel is
-															 * baserel */
-{
-	List	   *candidates = NIL;	/* List* of goo_fix_plans  */
+plan_geqo_goo(PlannerInfo *root, Topology * topology){
+	List	   *candidates = NIL;
 	List	   *initial_plans = NIL;
 	List	   *partials = NIL;
 	ListCell   *lc = NULL;
@@ -1072,7 +1077,7 @@ plan_geqo_goo(PlannerInfo *root, Topology * topology)		/* only if each rel is
 											false);
 
 		if (candidate == NULL)
-		{						/* budget exceeded */
+		{
 			if (candidates != NIL)
 			{
 				ListCell   *lc1 = NULL;
@@ -1101,4 +1106,4 @@ plan_geqo_goo(PlannerInfo *root, Topology * topology)		/* only if each rel is
 					initial_plans,
 					candidates);
 	return partials;
-}
+}*/
