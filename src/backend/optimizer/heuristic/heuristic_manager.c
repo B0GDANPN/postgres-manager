@@ -4,7 +4,6 @@
 #include "nodes/nodes.h"
 #include "nodes/pathnodes.h"
 #include "nodes/pg_list.h"
-#include "optimizer/geqo.h"
 #include "optimizer/heuristic/graph_utils.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
@@ -20,12 +19,14 @@ static const double budget_soft_limit = 0.9;
 static const double k1 = 0.5;
 static const double k2 = 0.5;
 static const double k3 = 0.5;
-typedef struct goo_fix_plan
+
+/*typedef struct goo_fix_plan
 {
-	int		   *order;			/* array int[count_rel + 1] */
+	int		   *order;	array int[count_rel + 1]
 	RelOptInfo *plan;
-}			goo_fix_plan;
+}			goo_fix_plan;*/
 static List *choose_min_cost_cover(List *partial_plans);
+static RelOptInfo *make_rel(PlannerInfo *root, RelOptInfo *left, RelOptInfo *right);
 static RelOptInfo *plan_topology(PlannerInfo *root, Topology * topology);
 
 static List *goo(PlannerInfo *root, List *initial_rels,
@@ -214,7 +215,7 @@ heuristic_join_search(PlannerInfo *root, List *initial_rels)
  */
 static List *
 goo(PlannerInfo *root, List *initial_rels,
-	bool clauseless, bool force)
+	bool clauseless, bool force)	/* TODO cost (1), select(2), sizes(3+) */
 {
 	while (list_length(initial_rels) > 1)
 	{
@@ -233,7 +234,7 @@ goo(PlannerInfo *root, List *initial_rels,
 			RelOptInfo *rel1 = (RelOptInfo *) lfirst(i);
 			ListCell   *j = NULL;
 
-			foreach(j, initial_rels)
+			for_each_cell(j, initial_rels, lnext(initial_rels, i))
 			{
 				RelOptInfo *rel2 = NULL;
 
@@ -262,8 +263,7 @@ goo(PlannerInfo *root, List *initial_rels,
 		}
 		best_rel1 = (RelOptInfo *) lfirst(best_lc1);
 		best_rel2 = (RelOptInfo *) lfirst(best_lc2);
-		best_rel = make_join_rel(root, best_rel1, best_rel2);
-		set_cheapest(best_rel);
+		best_rel = make_rel(root, best_rel1, best_rel2);
 		root->spent_budget += best_rel->cheapest_total_path->total_cost;
 		first = list_cell_number(initial_rels, best_lc1);
 		second = list_cell_number(initial_rels, best_lc2);
@@ -502,12 +502,11 @@ plan_chain_dp(PlannerInfo *root, Topology * topology)
 					success = false;
 					break;
 				}
-				join = make_join_rel(root, dp[i][k], dp[k + 1][j]);
+				join = make_rel(root, dp[i][k], dp[k + 1][j]);
 				if (join == NULL)
 				{
 					continue;
 				}
-				set_cheapest(join);
 				if (join->cheapest_total_path == NULL)
 				{
 					continue;
@@ -622,11 +621,10 @@ plan_cycle(PlannerInfo *root, Topology * topology)
 
 		if (root->spent_budget + tmp <= root->topology_budget * budget_soft_limit)
 		{
-			RelOptInfo *join = make_join_rel(root, chain_plan, removed_rel);
+			RelOptInfo *join = make_rel(root, chain_plan, removed_rel);
 
 			if (join != NULL)
 			{
-				set_cheapest(join);
 				if (join->cheapest_total_path != NULL)
 				{
 					Cost		join_cost = join->cheapest_total_path->total_cost;
@@ -714,8 +712,7 @@ plan_star(PlannerInfo *root, Topology * topology)
 				Cost		join_cost;
 
 				was_join = true;
-				new_center = make_join_rel(root, center_rel, rel);
-				set_cheapest(new_center);
+				new_center = make_rel(root, center_rel, rel);
 				ind_array[best_ind_ray]++;
 				join_cost = new_center->cheapest_total_path->total_cost;
 				root->spent_budget += join_cost;
@@ -844,8 +841,7 @@ plan_star2(PlannerInfo *root, Topology * topology)
 			return partials;
 		}
 
-		join = make_join_rel(root, center_rel, best_rel);
-		set_cheapest(join);
+		join = make_rel(root, center_rel, best_rel);
 		join_cost = join->cheapest_total_path->total_cost;
 		root->spent_budget += join_cost;
 		center_rel = join;
@@ -955,13 +951,12 @@ plan_dp_sub(PlannerInfo *root, Topology * topology)
 			{
 				return partials;
 			}
-			join = make_join_rel(root, left_plan, right_plan);
+			join = make_rel(root, left_plan, right_plan);
 			if (join == NULL)
 			{
 				left_bm = (left_bm - join_bm) & join_bm;
 				continue;
 			}
-			set_cheapest(join);
 			join_cost = join->cheapest_total_path->total_cost;
 			root->spent_budget += join_cost;
 			if (join->cheapest_total_path->total_cost < best_costs[join_bm])
@@ -977,6 +972,24 @@ plan_dp_sub(PlannerInfo *root, Topology * topology)
 	pfree(best_plans);
 	pfree(best_costs);
 	return list_make1(best_plan);
+}
+static RelOptInfo *
+make_rel(PlannerInfo *root, RelOptInfo *left, RelOptInfo *right)
+{
+	RelOptInfo *joinrel = make_join_rel(root, left, right);
+
+	if (joinrel)
+	{
+		generate_partitionwise_join_paths(root, joinrel);
+		if (!bms_equal(joinrel->relids, root->all_query_rels))
+		{
+			generate_useful_gather_paths(root, joinrel, false);
+		}
+		set_cheapest(joinrel);
+	}
+
+	return joinrel;
+
 }
 
 /*
