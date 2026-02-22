@@ -423,7 +423,7 @@ is_connected(List *all_vertexes, size_t bitmap)
 	ListCell   *lc = NULL;
 	bool		connected = true;
 
-	for (int i = 0; (uint64) 1 << i <= bitmap; i++)
+	for (uint64 i = 0; (uint64) (1 << i) <= bitmap; i++)
 	{
 		if (bitmap & ((uint64) 1 << i))
 		{
@@ -942,20 +942,25 @@ Selectivity
 get_selectivity(PlannerInfo *root, RelOptInfo *rel1,
 				RelOptInfo *rel2)
 {
-	RelOptInfo	joinrel;
+	RelOptInfo	joinrel = {0};
 	SpecialJoinInfo sjinfo;
 	List	   *clauses;
 	Selectivity result;
 
-	joinrel.relids = bms_union(rel1->relids, rel2->relids);
+	Relids		base_relids = bms_union(rel1->relids, rel2->relids);
+
 	init_dummy_sjinfo(&sjinfo, rel1->relids, rel2->relids);
 	joinrel.relids =
-		add_outer_joins_to_relids(root, joinrel.relids, &sjinfo, NULL);
+		add_outer_joins_to_relids(root, base_relids, &sjinfo, NULL);
 	clauses =
 		build_joinrel_restrictlist(root, &joinrel, rel1, rel2, &sjinfo);
 
 	result =
 		clauselist_selectivity(root, clauses, 0, JOIN_INNER, &sjinfo);
+	if (joinrel.relids != base_relids)
+	{
+		bms_free(base_relids);
+	}
 	bms_free(joinrel.relids);
 	return result;
 }
@@ -1008,71 +1013,27 @@ set_id(PlannerInfo *root, Topology * topology)
 void
 set_sel_topology(PlannerInfo *root, Topology * topology)
 {
-	Relids		relids_topology = NULL;
+	Selectivity sel = 1.0;
 	List	   *vertexes = topology->vertexes;
-	List	   *clauses = NIL;
-	ListCell   *lc = NULL;
-	List	   *implied_clauses;
-	SpecialJoinInfo sjinfo;
-	Selectivity sel;
+	ListCell   *lc;
 
 	foreach(lc, vertexes)
 	{
-		RelOptInfo *rel = ((Vertex *) lfirst(lc))->rel;
+		Vertex	   *v = (Vertex *) lfirst(lc);
+		ListCell   *lc2;
 
-		relids_topology = bms_add_members(relids_topology, rel->relids);
-	}
-
-	foreach(lc, vertexes)
-	{
-		RelOptInfo *rel = ((Vertex *) lfirst(lc))->rel;
-		ListCell   *lc2 = NULL;
-
-		foreach(lc2, rel->joininfo)
+		foreach(lc2, v->adj)
 		{
-			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc2);
-			Relids		clause_relids = rinfo->required_relids;
+			Vertex	   *nbr = (Vertex *) lfirst(lc2);
 
-			if (!bms_is_subset(clause_relids, relids_topology))
+			if (v->index < nbr->index &&
+				nbr->topology_id == v->topology_id)
 			{
-				continue;
+				sel *= get_selectivity(root, v->rel, nbr->rel);
 			}
-
-			if (bms_membership(clause_relids) != BMS_MULTIPLE)
-			{
-				continue;
-			}
-
-			if (list_member_ptr(clauses, rinfo))
-			{
-				continue;
-			}
-
-			clauses = lappend(clauses, rinfo);
 		}
 	}
-	implied_clauses = NIL;
-	foreach(lc, vertexes)
-	{
-		RelOptInfo *inner_rel = ((Vertex *) lfirst(lc))->rel;
-		Relids		outer_relids = bms_difference(relids_topology, inner_rel->relids);
 
-		/* SpecialJoinInfo sjinfo; */
-		/* init_dummy_sjinfo(&sjinfo, outer_relids, inner_rel->relids); */
-
-		implied_clauses = list_concat_unique(
-											 implied_clauses,
-											 generate_join_implied_equalities(root, relids_topology, outer_relids,
-																			  inner_rel, NULL));
-		bms_free(outer_relids);
-	}
-	clauses = list_concat(clauses, implied_clauses);
-
-	init_dummy_sjinfo(&sjinfo, relids_topology, relids_topology);
-	sel =
-		clauselist_selectivity(root, clauses, 0, JOIN_INNER, &sjinfo);
-	list_free(clauses);
-	bms_free(relids_topology);
 	topology->sel = sel;
 }
 
@@ -1091,7 +1052,7 @@ Cost
 cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 {
 	Cost		min_cost = DBL_MAX;
-	JoinPathExtraData extra;
+	JoinPathExtraData extra = {0};
 	RelOptInfo *outer_rels[2] = {rel1, rel2};
 	RelOptInfo *inner_rels[2] = {rel2, rel1};
 
@@ -1105,24 +1066,25 @@ cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 		List	   *hashclauses = NIL;
 		List	   *mergeclauses = NIL;
 		SpecialJoinInfo sjinfo;
-		RelOptInfo	joinrel;
+		RelOptInfo	joinrel = {0};
+
 		List	   *restrictlist = NIL;
 		ListCell   *lc = NULL;
 
+		/* memset(&joinrel, 0, sizeof(RelOptInfo)); */
 		if (PATH_PARAM_BY_REL(outer_path, inner_rel) ||
 			PATH_PARAM_BY_REL(inner_path, outer_rel))
 		{
 			continue;
 		}
+		Relids		base_relids = bms_union(outer_rel->relids, inner_rel->relids);
 
-		joinrel.relids = bms_union(outer_rel->relids, inner_rel->relids);
 		init_dummy_sjinfo(&sjinfo, outer_rel->relids, inner_rel->relids);
-		joinrel.relids =
-			add_outer_joins_to_relids(root, joinrel.relids, &sjinfo, NULL);
+		joinrel.relids = add_outer_joins_to_relids(root, base_relids, &sjinfo, NULL);
+
 		restrictlist = build_joinrel_restrictlist(root, &joinrel, outer_rel,
 												  inner_rel, &sjinfo);
 
-		memset(&extra, 0, sizeof(JoinPathExtraData));
 		extra.restrictlist = restrictlist;
 		extra.mergeclause_list = NIL;
 		extra.inner_unique = false;
@@ -1206,7 +1168,8 @@ cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 				min_cost = workspace.total_cost;
 			}
 		}
-
+		if (joinrel.relids != base_relids)
+			bms_free(base_relids);
 		bms_free(joinrel.relids);
 	}
 
