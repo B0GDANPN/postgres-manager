@@ -22,6 +22,8 @@ static const double k2 = 0.25;
 static const double k3 = 0.15;
 
 static List *choose_min_cost_cover(List *partial_plans);
+static List *chain_dp_optimal_cover(RelOptInfo ***dp, int n);
+static List *dp_sub_optimal_cover(RelOptInfo **best_plans, Cost *best_costs, int n);
 static RelOptInfo *make_rel(PlannerInfo *root, RelOptInfo *left, RelOptInfo *right);
 static RelOptInfo *plan_topology(PlannerInfo *root, Topology * topology);
 
@@ -127,6 +129,7 @@ heuristic_join_search(PlannerInfo *root, List *initial_rels)
 		RelOptInfo *comp_plan = NULL;
 		Cost		component_budget;
 		Cost		current_budget;
+		bool		first_iter = true;
 
 		split_budget_among_topologies(components, root->global_budget, lc);
 
@@ -134,6 +137,7 @@ heuristic_join_search(PlannerInfo *root, List *initial_rels)
 
 		component_budget = component->budget;
 		current_budget = component_budget * b1;
+
 		while (list_length(comp_vertexes) > 1)
 		{
 			bool	   *used_vertexes = NULL;
@@ -180,8 +184,21 @@ heuristic_join_search(PlannerInfo *root, List *initial_rels)
 			}
 			component_budget += current_budget; /* maybe remain budget */
 			current_budget = component_budget * q;
-			list_free(comp_vertexes);
+
+			if (first_iter)
+			{
+				list_free(comp_vertexes);	/* spine only — Vertex* owned by
+											 * component */
+				first_iter = false;
+			}
+			else
+			{
+				free_join_graph(comp_vertexes); /* full cleanup of
+												 * build_join_graph output */
+			}
+			list_free(topologies);
 			comp_vertexes = build_join_graph(root, topology_plans);
+			list_free(topology_plans);
 			pfree(used_vertexes);
 		}
 		v = (Vertex *) linitial(comp_vertexes);
@@ -282,6 +299,173 @@ goo(PlannerInfo *root, List *initial_rels,
 	}
 
 	return initial_rels;
+}
+
+/*
+ * Optimal interval cover for a partially-filled chain DP table.
+ *
+ * cover_cost[i] = minimum total cost to cover positions [0, i-1].
+ * cover_from[i] = start index of the last interval in that optimal cover.
+ *
+ * Recurrence:
+ *   cover_cost[0] = 0   (empty prefix, nothing to cover)
+ *   cover_cost[i] = min over j in [0, i-1] where dp[j][i-1] != NULL:
+ *                     cover_cost[j] + dp[j][i-1]->cheapest_total_path->total_cost
+ */
+static List *
+chain_dp_optimal_cover(RelOptInfo ***dp, int n)
+{
+	Cost	   *cover_cost = (Cost *) palloc((n + 1) * sizeof(Cost));
+	int		   *cover_from = (int *) palloc((n + 1) * sizeof(int));
+	List	   *plans = NIL;
+	int			pos;
+
+	cover_cost[0] = 0.0;
+	cover_from[0] = -1;
+
+	for (int i = 1; i <= n; i++)
+	{
+		cover_cost[i] = DBL_MAX;
+		cover_from[i] = -1;
+
+		for (int j = i - 1; j >= 0; j--)
+		{
+			Cost		candidate;
+
+			if (dp[j][i - 1] == NULL)
+				continue;
+
+			candidate = cover_cost[j] +
+				dp[j][i - 1]->cheapest_total_path->total_cost;
+
+			if (candidate < cover_cost[i])
+			{
+				cover_cost[i] = candidate;
+				cover_from[i] = j;
+			}
+		}
+	}
+
+	if (cover_cost[n] >= DBL_MAX)
+	{
+		/*
+		 * Shouldn't happen: at minimum, every singleton dp[i][i] is non-NULL,
+		 * so a cover always exists.  Fall through to the greedy path as a
+		 * safeguard.
+		 */
+		pfree(cover_cost);
+		pfree(cover_from);
+		return NIL;
+	}
+
+	/* Backtrack to reconstruct the partition. */
+	pos = n;
+	while (pos > 0)
+	{
+		int			start = cover_from[pos];
+
+		plans = lcons(dp[start][pos - 1], plans);	/* prepend →
+													 * left-to-right order */
+		pos = start;
+	}
+
+	pfree(cover_cost);
+	pfree(cover_from);
+	return plans;
+}
+
+/**
+ * @brief Optimal minimum-cost cover of all vertices using computed subplans.
+ *
+ * Given the best_plans[] and best_costs[] arrays from dp_sub (indexed by
+ * bitmask), find a partition of the full vertex set into non-overlapping
+ * subsets such that each subset has a computed plan and the total cost
+ * is minimized.
+ *
+ * Uses subset-DP: cover_cost[mask] = min cost to cover exactly the
+ * vertices in mask.  Enumerates all submasks of each mask.
+ *
+ * @param best_plans  Array indexed by bitmask; best_plans[m] is the best
+ *                    RelOptInfo for vertex set m, or NULL if not computed.
+ * @param best_costs  Parallel cost array.
+ * @param n           Number of vertices (must be <= ~15 for tractability).
+ *
+ * @return List of RelOptInfo* forming an optimal non-overlapping cover,
+ *         or NIL if no complete cover exists.
+ */
+static List *
+dp_sub_optimal_cover(RelOptInfo **best_plans, Cost *best_costs,
+					 int n)
+{
+	size_t		total_sets = ((size_t) 1) << n;
+	size_t		full_mask = total_sets - 1;
+	Cost	   *cover_cost;
+	size_t	   *cover_from;		/* which submask was chosen last */
+	List	   *result = NIL;
+	size_t		mask;
+
+	cover_cost = (Cost *) palloc(total_sets * sizeof(Cost));
+	cover_from = (size_t *) palloc(total_sets * sizeof(size_t));
+
+	cover_cost[0] = 0.0;
+	cover_from[0] = 0;
+
+	for (mask = 1; mask < total_sets; mask++)
+	{
+		size_t		sub;
+
+		cover_cost[mask] = DBL_MAX;
+		cover_from[mask] = 0;
+
+		/* Enumerate all non-empty submasks of mask. */
+		for (sub = mask; sub > 0; sub = (sub - 1) & mask)
+		{
+			size_t		complement = mask ^ sub;
+			Cost		candidate;
+
+			if (best_plans[sub] == NULL)
+				continue;
+
+			if (cover_cost[complement] >= DBL_MAX)
+				continue;		/* can't cover the rest */
+
+			candidate = cover_cost[complement] + best_costs[sub];
+
+			if (candidate < cover_cost[mask])
+			{
+				cover_cost[mask] = candidate;
+				cover_from[mask] = sub;
+			}
+		}
+	}
+
+	if (cover_cost[full_mask] >= DBL_MAX)
+	{
+		/*
+		 * No complete cover found — should not happen since singletons are
+		 * always present, but return NIL as a safeguard.
+		 */
+		pfree(cover_cost);
+		pfree(cover_from);
+		return NIL;
+	}
+
+	/* Backtrack to reconstruct the partition. */
+	mask = full_mask;
+	while (mask != 0)
+	{
+		size_t		chosen = cover_from[mask];
+
+		Assert(chosen != 0);
+		Assert(best_plans[chosen] != NULL);
+
+		result = lappend(result, best_plans[chosen]);
+		mask ^= chosen;			/* remove chosen bits */
+	}
+
+	pfree(cover_cost);
+	pfree(cover_from);
+	return result;
 }
 
 /**
@@ -414,8 +598,14 @@ plan_topology(PlannerInfo *root, Topology * topology)
 		return plan;
 	}
 
-	/* fail planning DP, very expensive, so try cheaper. */
-	initial_rels = choose_min_cost_cover(partial_plans);
+	if (topology->form != CHAIN && topology->form != DENSITY_GRAPH)
+	{
+		initial_rels = choose_min_cost_cover(partial_plans);
+	}
+	else
+	{
+		initial_rels = partial_plans;
+	}
 	saved_rels = root->initial_rels;
 	root->initial_rels = initial_rels;
 	root->spent_budget = 0;
@@ -547,22 +737,13 @@ plan_chain_dp(PlannerInfo *root, Topology * topology)
 		return list_make1(full_plan);
 	}
 
-	plans = NIL;
-	for (i = 0; i < n; i++)
+	plans = chain_dp_optimal_cover(dp, n);
+
+	if (plans == NIL)
 	{
-		int			best_j = i;
-
-		for (j = n - 1; j > i; j--)
-		{
-			if (dp[i][j] != NULL)
-			{
-				best_j = j;
-				break;
-			}
-		}
-
-		plans = lappend(plans, dp[i][best_j]);
-		i = best_j;
+		/* Fallback: shouldn't happen, but use singleton rels. */
+		for (i = 0; i < n; i++)
+			plans = lappend(plans, dp[i][i]);
 	}
 	for (i = 0; i < n; i++)
 	{
@@ -643,12 +824,14 @@ plan_cycle(PlannerInfo *root, Topology * topology)
 						root->topology_budget * budget_soft_limit)
 					{
 						root->spent_budget += join_cost;
+						pfree(chain_topology);
 						return list_make1(join);
 					}
 				}
 			}
 		}
 	}
+	pfree(chain_topology);
 	return lappend(chain_plans, v_removed->rel);
 }
 
@@ -876,9 +1059,9 @@ plan_dp_sub(PlannerInfo *root, Topology * topology)
 	RelOptInfo **best_plans = NULL;
 	Cost	   *best_costs = NULL;
 	List	   *partials = NIL;
-	RelOptInfo *best_plan = NULL;
 	int			n = list_length(topology->vertexes);
 	size_t		total_sets = ((size_t) 1) << n;
+	bool		force_exit = false;
 
 	best_plans = (RelOptInfo **) palloc0(total_sets * sizeof(RelOptInfo *));
 	best_costs = (Cost *) palloc0(total_sets * sizeof(Cost));
@@ -896,7 +1079,6 @@ plan_dp_sub(PlannerInfo *root, Topology * topology)
 		Vertex	   *v = (Vertex *) lfirst(lc_v);
 
 		best_plans[mask] = v->rel;
-		partials = lappend(partials, v->rel);
 		best_costs[mask] = best_plans[mask]->cheapest_total_path->total_cost;
 	}
 
@@ -904,6 +1086,10 @@ plan_dp_sub(PlannerInfo *root, Topology * topology)
 	{
 		size_t		left_bm = (-join_bm) & join_bm;
 
+		if (force_exit)
+		{
+			break;
+		}
 		if (pg_popcount64(join_bm) <= 1)
 		{
 			continue;
@@ -932,20 +1118,6 @@ plan_dp_sub(PlannerInfo *root, Topology * topology)
 				left_bm = (left_bm - join_bm) & join_bm;
 				continue;
 			}
-			/**
-			if (pg_popcount64(left_bm) > 1 &&
-				!is_connected(topology->vertexes, left_bm))
-			{
-				left_bm = (left_bm - join_bm) & join_bm;
-				continue;
-			}
-			if (pg_popcount64(right_bm) > 1 &&
-				!is_connected(topology->vertexes, right_bm))
-			{
-				left_bm = (left_bm - join_bm) & join_bm;
-				continue;
-			}
-			*/
 			left_plan = best_plans[left_bm];
 			right_plan = best_plans[right_bm];
 			if (!has_edge(root, left_plan, right_plan))
@@ -957,9 +1129,8 @@ plan_dp_sub(PlannerInfo *root, Topology * topology)
 			prel_join_cost = cost_edge(root, left_plan, right_plan);
 			if (root->spent_budget + prel_join_cost > root->topology_budget * budget_soft_limit)
 			{
-				pfree(best_plans);
-				pfree(best_costs);
-				return partials;
+				force_exit = true;
+				break;
 			}
 			join = make_rel(root, left_plan, right_plan);
 			if (join == NULL)
@@ -973,18 +1144,25 @@ plan_dp_sub(PlannerInfo *root, Topology * topology)
 			{
 				best_costs[join_bm] = join->cheapest_total_path->total_cost;
 				best_plans[join_bm] = join;
-				partials = lappend(partials, join);
 			}
 			left_bm = (left_bm - join_bm) & join_bm;
 		}
 	}
-	if (best_plans[total_sets - 1] != NULL)
 	{
-		best_plan = best_plans[total_sets - 1];
-		pfree(best_plans);
-		pfree(best_costs);
-		return list_make1(best_plan);
+		List	   *optimal = dp_sub_optimal_cover(best_plans, best_costs, n);
+
+		if (optimal != NIL)
+		{
+			pfree(best_plans);
+			pfree(best_costs);
+			return optimal;		/* may be list_length==1 (full plan) or a
+								 * partition */
+		}
 	}
+
+	/* Fallback: return raw partials for greedy cover. */
+	for (int k = 0; k < n; k++)
+		partials = lappend(partials, best_plans[((size_t) 1) << k]);
 	pfree(best_plans);
 	pfree(best_costs);
 	return partials;

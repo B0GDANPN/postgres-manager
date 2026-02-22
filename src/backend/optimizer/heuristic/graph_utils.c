@@ -12,7 +12,9 @@
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
 #include "postgres.h"
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
+#include "utils/palloc.h"
 #include <float.h>
 #include <limits.h>
 #include <optimizer/cost.h>
@@ -33,9 +35,9 @@ static bool dfs_cycle(PlannerInfo *root, Vertex * prev, Vertex * cur,
 static bool is_star(Vertex * center, const bool *used_vertexes);
 static List *find_star(PlannerInfo *root, Vertex * center, bool *used_vertexes,
 					   List **chains);
-static Vertex * find_min_degree_vertex(List *sub);
-static double density(List *sub);
-static int	count_edges(List *sub);
+static Vertex * find_min_degree_vertex(PlannerInfo *root, List *sub);
+static double density(PlannerInfo *root, List *sub);
+static int	count_edges(PlannerInfo *root, List *sub);
 
 /**
  * @brief Check whether two relations have a legal simple join edge.
@@ -326,6 +328,7 @@ split_components(PlannerInfo *root, List *vertexes)
 
 			component->vertexes = sub;
 			component->form = COMPONENT;
+			set_id(root, component);
 			set_sel_topology(root, component);
 			set_vol_topology(root, component);
 			set_complexity_topology(root, component);
@@ -423,7 +426,7 @@ is_connected(List *all_vertexes, size_t bitmap)
 	ListCell   *lc = NULL;
 	bool		connected = true;
 
-	for (uint64 i = 0; (uint64) (1 << i) <= bitmap; i++)
+	for (uint64 i = 0; ((uint64) 1 << i) <= bitmap; i++)
 	{
 		if (bitmap & ((uint64) 1 << i))
 		{
@@ -703,14 +706,18 @@ find_stars(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 }
 
 /**
- * @brief Count edges inside a vertex subset.
+ * @brief Count "good" internal edges in a vertex subset.
  *
+ * An edge is counted only when its pairwise join selectivity does not
+ * exceed border_selectivity, matching the same filter that dfs_cycle
+ * applies.  This prevents near-Cartesian edges from inflating the
+ * density of a candidate subgraph.
  * @param sub Vertex subset.
  *
  * @return Number of internal edges.
  */
 static int
-count_edges(List *sub)
+count_edges(PlannerInfo *root, List *sub)
 {
 	int			m = 0;
 	ListCell   *lc = NULL;
@@ -726,7 +733,12 @@ count_edges(List *sub)
 
 			if (v1->index < v2->index && list_member_ptr(sub, v2))
 			{
-				m++;
+				Selectivity sel = get_selectivity(root, v1->rel, v2->rel);
+
+				if (sel <= border_selectivity)
+				{
+					m++;
+				}
 			}
 		}
 	}
@@ -761,30 +773,32 @@ update_indices(Topology * component)
  * @return Density in [0,1], or 0 for small sets.
  */
 static double
-density(List *sub)
+density(PlannerInfo *root, List *sub)
 {
 	int			n = list_length(sub);
 	int			m;
 	double		d;
 
 	if (n < 4)
-	{
 		return 0.0;
-	}
 
-	m = count_edges(sub);
+	m = count_edges(root, sub);
 	d = (double) m / ((double) n * (n - 1) / 2.0);
 	return d;
 }
 
 /**
- * @brief Find the minimum-degree vertex in a subset.
+ * @brief Find the vertex with minimum "good" degree in a subset.
+ *
+ * Only edges with selectivity <= border_selectivity are counted
+ * toward a vertex's degree, consistent with the density metric.
  *
  * @param sub Vertex subset.
  *
  * @return Vertex with the lowest internal degree.
  */
-static Vertex * find_min_degree_vertex(List *sub)
+static Vertex *
+find_min_degree_vertex(PlannerInfo *root, List *sub)
 {
 	int			best_deg = INT_MAX;
 	Vertex	   *best_v = NULL;
@@ -798,9 +812,16 @@ static Vertex * find_min_degree_vertex(List *sub)
 
 		foreach(lc2, v->adj)
 		{
-			if (list_member_ptr(sub, lfirst(lc2)))
+			Vertex	   *nbr = (Vertex *) lfirst(lc2);
+
+			if (list_member_ptr(sub, nbr))
 			{
-				deg++;
+				Selectivity sel = get_selectivity(root, v->rel, nbr->rel);
+
+				if (sel <= border_selectivity)
+				{
+					deg++;
+				}
 			}
 		}
 
@@ -855,14 +876,14 @@ find_dense_subgraphs(PlannerInfo *root, List *vertexes, bool *used)
 		while (list_length(candidate) >= 4)
 		{
 			Vertex	   *vmin = NULL;
-			double		cur_density = density(candidate);
+			double		cur_density = density(root, candidate);
 
 			if (cur_density >= THRESH)
 			{
 				break;
 			}
 
-			vmin = find_min_degree_vertex(candidate);
+			vmin = find_min_degree_vertex(root, candidate);
 			if (vmin == NULL)
 			{
 				break;
@@ -871,7 +892,7 @@ find_dense_subgraphs(PlannerInfo *root, List *vertexes, bool *used)
 			candidate = list_delete_ptr(candidate, vmin);
 		}
 
-		final_density = density(candidate);
+		final_density = density(root, candidate);
 		if (list_length(candidate) < 4 || final_density < THRESH)
 		{
 			list_free(candidate);
@@ -906,7 +927,7 @@ find_dense_subgraphs(PlannerInfo *root, List *vertexes, bool *used)
 static void
 set_complexity_topology(PlannerInfo *root, Topology * topology)
 {
-	DPHypContext context;
+	DPHypContext context = {0};
 	List	   *initial_rels = NIL;
 	ListCell   *lc = NULL;
 	uint64		subgraphs_count;
@@ -925,6 +946,11 @@ set_complexity_topology(PlannerInfo *root, Topology * topology)
 
 	subgraphs_count = count_cc(&context, dphyp_geqo_cc_threshold);
 	topology->ccp = subgraphs_count;
+	list_free(context.initial_rels);
+	list_free(context.simple_hypernodes);
+	pfree(context.simple_edges);
+	pfree(context.complex_edges);
+	hash_destroy(context.dptable);
 }
 
 /**
@@ -1070,6 +1096,7 @@ cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 
 		List	   *restrictlist = NIL;
 		ListCell   *lc = NULL;
+		Relids		base_relids = NULL;
 
 		/* memset(&joinrel, 0, sizeof(RelOptInfo)); */
 		if (PATH_PARAM_BY_REL(outer_path, inner_rel) ||
@@ -1077,7 +1104,7 @@ cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 		{
 			continue;
 		}
-		Relids		base_relids = bms_union(outer_rel->relids, inner_rel->relids);
+		base_relids = bms_union(outer_rel->relids, inner_rel->relids);
 
 		init_dummy_sjinfo(&sjinfo, outer_rel->relids, inner_rel->relids);
 		joinrel.relids = add_outer_joins_to_relids(root, base_relids, &sjinfo, NULL);
@@ -1186,4 +1213,30 @@ print_trace(RelOptInfo *rel)
 	appendStringInfo(&buf, "%s\n", rel->trace);
 	ereport(NOTICE, (errmsg("%s\n", buf.data)));
 	pfree(buf.data);
+}
+
+/**
+ * @brief Free a join graph built by build_join_graph().
+ *
+ * Frees each Vertex's adjacency list spine, the Vertex struct itself,
+ * and the outer list.  Does NOT touch the RelOptInfo* that each Vertex
+ * references (those belong to the planner's join_rel_list).
+ *
+ * @param graph  List of Vertex* to free.  Must have been created by
+ *               build_join_graph(); do NOT pass component->vertexes.
+ */
+void
+free_join_graph(List *graph)
+{
+	ListCell   *lc;
+
+	foreach(lc, graph)
+	{
+		Vertex	   *v = (Vertex *) lfirst(lc);
+
+		list_free(v->adj);		/* spine only — neighbors are in the same
+								 * list */
+		pfree(v);
+	}
+	list_free(graph);
 }
