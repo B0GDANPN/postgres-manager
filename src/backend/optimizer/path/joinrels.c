@@ -109,19 +109,19 @@ join_search_one_level(PlannerInfo *root, int level)
 			{
 				first_rel = 0;
 			}
-			if (root->spent_budget > root->topology_budget)
-			{
-				return false;
-			}
+			//if (root->spent_budget > root->topology_budget)
+			//{
+			//	return false;
+			//}
 			result = make_rels_by_clause_joins(root,
 											   old_rel,
 											   joinrels[1],
 											   first_rel);
 
-			if (!result)
-			{
-				return false;
-			}
+			//if (!result)
+			//{
+			//	return false;
+			//}
 		}
 		else
 		{
@@ -139,18 +139,18 @@ join_search_one_level(PlannerInfo *root, int level)
 			 */
 			bool		result;
 
-			if (root->spent_budget > root->topology_budget)
-			{
-				return false;
-			}
+			//if (root->spent_budget > root->topology_budget)
+			//{
+			//	return false;
+			//}
 			result = make_rels_by_clauseless_joins(root,
 												   old_rel,
 												   joinrels[1]);
 
-			if (!result)
-			{
-				return false;
-			}
+			//if (!result)
+			//{
+			//	return false;
+			//}
 		}
 	}
 
@@ -215,20 +215,19 @@ join_search_one_level(PlannerInfo *root, int level)
 					if (have_relevant_joinclause(root, old_rel, new_rel) ||
 						have_join_order_restriction(root, old_rel, new_rel))
 					{
-						Cost		tmp;
+						//Cost		tmp = cost_edge(root, old_rel, new_rel);
 
-						if (root->spent_budget > root->topology_budget)
-						{
-							return false;
-						}
-						tmp = cost_edge(root, old_rel, new_rel);
+						//if (root->spent_budget + tmp > root->topology_budget)
+						//{
+						//	return false;
+						//}
 
-						if (root->spent_budget + tmp > root->topology_budget)
-						{
-							return false;
-						}
+						//if (root->spent_budget + tmp > root->topology_budget)
+						//{
+						//	return false;
+						//}
 						(void) make_join_rel(root, old_rel, new_rel);
-						root->spent_budget += tmp;
+						//root->spent_budget += tmp;
 					}
 				}
 			}
@@ -265,18 +264,18 @@ join_search_one_level(PlannerInfo *root, int level)
 			bool		result;
 			RelOptInfo *old_rel = (RelOptInfo *) lfirst(r);
 
-			if (root->spent_budget > root->topology_budget)
-			{
-				return false;
-			}
+			//if (root->spent_budget > root->topology_budget)
+			//{
+			//	return false;
+			//}
 			result = make_rels_by_clauseless_joins(root,
 												   old_rel,
 												   joinrels[1]);
 
-			if (!result)
-			{
-				return false;
-			}
+			//if (!result)
+			//{
+			//	return false;
+			//}
 		}
 
 		/*----------
@@ -340,14 +339,14 @@ make_rels_by_clause_joins(PlannerInfo *root, RelOptInfo *old_rel, List *other_re
 			(have_relevant_joinclause(root, old_rel, other_rel) ||
 			 have_join_order_restriction(root, old_rel, other_rel)))
 		{
-			Cost		tmp = cost_edge(root, old_rel, other_rel);
+			//Cost		tmp = cost_edge(root, old_rel, other_rel);
 
-			if (root->spent_budget > root->topology_budget)
-			{
-				return false;
-			}
+			//if (root->spent_budget + tmp > root->topology_budget)
+			//{
+			//	return false;
+			//}
 			(void) make_join_rel(root, old_rel, other_rel);
-			root->spent_budget += tmp;
+			//root->spent_budget += tmp;
 		}
 	}
 
@@ -378,14 +377,14 @@ make_rels_by_clauseless_joins(PlannerInfo *root, RelOptInfo *old_rel, List *othe
 
 		if (!bms_overlap(other_rel->relids, old_rel->relids))
 		{
-			Cost		tmp = cost_edge(root, old_rel, other_rel);
+			//Cost		tmp = cost_edge(root, old_rel, other_rel);
 
-			if (root->spent_budget + tmp > root->topology_budget)
-			{
-				return false;
-			}
+			//if (root->spent_budget + tmp > root->topology_budget)
+			//{
+			//	return false;
+			//}
 			(void) make_join_rel(root, old_rel, other_rel);
-			root->spent_budget += tmp;
+			//root->spent_budget += tmp;
 		}
 	}
 	return true;

@@ -20,15 +20,17 @@
  */
 
 #include "postgres.h"
-#include "nodes/pathnodes.h"
+
 #include <float.h>
 #include <limits.h>
+#include <math.h>
 
 #include "optimizer/geqo.h"
 #include "optimizer/joininfo.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "utils/memutils.h"
+
 
 /* A "clump" of already-joined relations within gimme_tree */
 typedef struct
@@ -37,9 +39,11 @@ typedef struct
 	int			size;			/* number of input relations in clump */
 } Clump;
 
-static List *merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
-						 bool force);
-static bool desirable_join(PlannerInfo *root, RelOptInfo *outer_rel, RelOptInfo *inner_rel);
+static List *merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump,
+						 int num_gene, bool force);
+static bool desirable_join(PlannerInfo *root,
+						   RelOptInfo *outer_rel, RelOptInfo *inner_rel);
+
 
 /*
  * geqo_eval
@@ -68,7 +72,9 @@ geqo_eval(PlannerInfo *root, Gene *tour, int num_gene)
 	 * temp context a child of the planner's normal context, so that it will
 	 * be freed even if we abort via ereport(ERROR).
 	 */
-	mycontext = AllocSetContextCreate(CurrentMemoryContext, "GEQO", ALLOCSET_DEFAULT_SIZES);
+	mycontext = AllocSetContextCreate(CurrentMemoryContext,
+									  "GEQO",
+									  ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(mycontext);
 
 	/*
@@ -109,15 +115,14 @@ geqo_eval(PlannerInfo *root, Gene *tour, int num_gene)
 		fitness = best_path->total_cost;
 	}
 	else
-	{
 		fitness = DBL_MAX;
-	}
 
 	/*
 	 * Restore join_rel_list to its former state, and put back original
 	 * hashtable if any.
 	 */
-	root->join_rel_list = list_truncate(root->join_rel_list, savelength);
+	root->join_rel_list = list_truncate(root->join_rel_list,
+										savelength);
 	root->join_rel_hash = savehash;
 
 	/* release all the memory acquired within gimme_tree */
@@ -160,8 +165,6 @@ gimme_tree(PlannerInfo *root, Gene *tour, int num_gene)
 	GeqoPrivateData *private = (GeqoPrivateData *) root->join_search_private;
 	List	   *clumps;
 	int			rel_count;
-	RelOptInfo *result = NULL;
-	Cost		cost_result;
 
 	/*
 	 * Sometimes, a relation can't yet be joined to others due to heuristics
@@ -184,7 +187,8 @@ gimme_tree(PlannerInfo *root, Gene *tour, int num_gene)
 
 		/* Get the next input relation */
 		cur_rel_index = (int) tour[rel_count];
-		cur_rel = (RelOptInfo *) list_nth(private->initial_rels, cur_rel_index - 1);
+		cur_rel = (RelOptInfo *) list_nth(private->initial_rels,
+										  cur_rel_index - 1);
 
 		/* Make it into a single-rel clump */
 		cur_clump = (Clump *) palloc(sizeof(Clump));
@@ -213,20 +217,9 @@ gimme_tree(PlannerInfo *root, Gene *tour, int num_gene)
 
 	/* Did we succeed in forming a single join relation? */
 	if (list_length(clumps) != 1)
-	{
 		return NULL;
-	}
-	result = ((Clump *) linitial(clumps))->joinrel;
-	cost_result = result->cheapest_total_path->total_cost;
 
-	if (private->cost_plan + cost_result > private->budget)
-	{
-		return NULL;
-	}
-
-	private->cost_plan += cost_result;
-	private->partial_plans = lappend(private->partial_plans, result);
-	return result;
+	return ((Clump *) linitial(clumps))->joinrel;
 }
 
 /*
@@ -253,7 +246,8 @@ merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
 	{
 		Clump	   *old_clump = (Clump *) lfirst(lc);
 
-		if (force || desirable_join(root, old_clump->joinrel, new_clump->joinrel))
+		if (force ||
+			desirable_join(root, old_clump->joinrel, new_clump->joinrel))
 		{
 			RelOptInfo *joinrel;
 
@@ -263,7 +257,9 @@ merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
 			 * root->join_rel_list yet, and so the paths constructed for it
 			 * will only include the ones we want.
 			 */
-			joinrel = make_join_rel(root, old_clump->joinrel, new_clump->joinrel);
+			joinrel = make_join_rel(root,
+									old_clump->joinrel,
+									new_clump->joinrel);
 
 			/* Keep searching if join order is not valid */
 			if (joinrel)
@@ -278,9 +274,7 @@ merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
 				 * grouping_planner).
 				 */
 				if (!bms_equal(joinrel->relids, root->all_query_rels))
-				{
 					generate_useful_gather_paths(root, joinrel, false);
-				}
 
 				/* Find and save the cheapest paths for this joinrel */
 				set_cheapest(joinrel);
@@ -309,9 +303,7 @@ merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
 	 * where it has size 1 --- it should always go at the end.
 	 */
 	if (clumps == NIL || new_clump->size == 1)
-	{
 		return lappend(clumps, new_clump);
-	}
 
 	/* Else search for the place to insert it */
 	for (pos = 0; pos < list_length(clumps); pos++)
@@ -319,9 +311,7 @@ merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
 		Clump	   *old_clump = (Clump *) list_nth(clumps, pos);
 
 		if (new_clump->size > old_clump->size)
-		{
 			break;				/* new_clump belongs before old_clump */
-		}
 	}
 	clumps = list_insert_nth(clumps, pos, new_clump);
 
@@ -332,7 +322,8 @@ merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
  * Heuristics for gimme_tree: do we want to join these two relations?
  */
 static bool
-desirable_join(PlannerInfo *root, RelOptInfo *outer_rel, RelOptInfo *inner_rel)
+desirable_join(PlannerInfo *root,
+			   RelOptInfo *outer_rel, RelOptInfo *inner_rel)
 {
 	/*
 	 * Join if there is an applicable join clause, or if there is a join order
@@ -340,9 +331,7 @@ desirable_join(PlannerInfo *root, RelOptInfo *outer_rel, RelOptInfo *inner_rel)
 	 */
 	if (have_relevant_joinclause(root, outer_rel, inner_rel) ||
 		have_join_order_restriction(root, outer_rel, inner_rel))
-	{
 		return true;
-	}
 
 	/* Otherwise postpone the join till later. */
 	return false;

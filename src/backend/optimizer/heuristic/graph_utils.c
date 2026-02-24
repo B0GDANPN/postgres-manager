@@ -23,8 +23,8 @@
 #include <string.h>
 
 static const uint64 dphyp_geqo_cc_threshold = 10000;
-static const double THRESH = 0.9;
-static const Selectivity border_selectivity = 0.2;
+static const double THRESH = 0.7;
+static const Selectivity border_selectivity = 0.26;
 static const int max_ray_length = 3;
 static const int min_length_cycle = 3;
 static void set_complexity_topology(PlannerInfo *root, Topology * topology);
@@ -35,9 +35,10 @@ static bool dfs_cycle(PlannerInfo *root, Vertex * prev, Vertex * cur,
 static bool is_star(Vertex * center, const bool *used_vertexes);
 static List *find_star(PlannerInfo *root, Vertex * center, bool *used_vertexes,
 					   List **chains);
-static Vertex * find_min_degree_vertex(PlannerInfo *root, List *sub);
-static double density(PlannerInfo *root, List *sub);
-static int	count_edges(PlannerInfo *root, List *sub);
+static Vertex * find_min_degree_vertex_cached(Selectivity *sel_cache, int nv, List *sub);
+static double density_cached(Selectivity *sel_cache, int nv, List *sub);
+static int	count_edges_cached(Selectivity *sel_cache, int nv, List *sub);
+static List *peel_dense(Selectivity *sel_cache, int nv, List *candidate);
 
 /**
  * @brief Check whether two relations have a legal simple join edge.
@@ -257,7 +258,7 @@ build_join_graph(PlannerInfo *root, List *initial_rels)
 			}
 		}
 	}
-	print_graph(root, vertexes);
+	//print_graph(root, vertexes);
 	return vertexes;
 }
 
@@ -706,18 +707,19 @@ find_stars(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 }
 
 /**
- * @brief Count "good" internal edges in a vertex subset.
+ * @brief Count "good" internal edges in a vertex subset using cached selectivities.
  *
- * An edge is counted only when its pairwise join selectivity does not
- * exceed border_selectivity, matching the same filter that dfs_cycle
- * applies.  This prevents near-Cartesian edges from inflating the
- * density of a candidate subgraph.
- * @param sub Vertex subset.
+ * An edge is counted only when its cached selectivity does not
+ * exceed border_selectivity.
  *
- * @return Number of internal edges.
+ * @param sel_cache  Flat nv*nv selectivity matrix; -1.0 = no edge.
+ * @param nv         Dimension of the cache (total vertices in component).
+ * @param sub        Vertex subset.
+ *
+ * @return Number of good internal edges.
  */
 static int
-count_edges(PlannerInfo *root, List *sub)
+count_edges_cached(Selectivity *sel_cache, int nv, List *sub)
 {
 	int			m = 0;
 	ListCell   *lc = NULL;
@@ -733,9 +735,9 @@ count_edges(PlannerInfo *root, List *sub)
 
 			if (v1->index < v2->index && list_member_ptr(sub, v2))
 			{
-				Selectivity sel = get_selectivity(root, v1->rel, v2->rel);
+				Selectivity sel = sel_cache[v1->index * nv + v2->index];
 
-				if (sel <= border_selectivity)
+				if (sel >= 0 && sel <= border_selectivity)
 				{
 					m++;
 				}
@@ -766,14 +768,16 @@ update_indices(Topology * component)
 }
 
 /**
- * @brief Compute edge density for a vertex subset.
+ * @brief Compute edge density for a vertex subset using cached selectivities.
  *
- * @param sub Vertex subset.
+ * @param sel_cache  Flat nv*nv selectivity matrix.
+ * @param nv         Cache dimension.
+ * @param sub        Vertex subset.
  *
  * @return Density in [0,1], or 0 for small sets.
  */
 static double
-density(PlannerInfo *root, List *sub)
+density_cached(Selectivity *sel_cache, int nv, List *sub)
 {
 	int			n = list_length(sub);
 	int			m;
@@ -782,23 +786,25 @@ density(PlannerInfo *root, List *sub)
 	if (n < 4)
 		return 0.0;
 
-	m = count_edges(root, sub);
+	m = count_edges_cached(sel_cache, nv, sub);
 	d = (double) m / ((double) n * (n - 1) / 2.0);
 	return d;
 }
 
 /**
- * @brief Find the vertex with minimum "good" degree in a subset.
+ * @brief Find the vertex with minimum "good" degree using cached selectivities.
  *
- * Only edges with selectivity <= border_selectivity are counted
+ * Only edges with cached selectivity <= border_selectivity are counted
  * toward a vertex's degree, consistent with the density metric.
  *
- * @param sub Vertex subset.
+ * @param sel_cache  Flat nv*nv selectivity matrix.
+ * @param nv         Cache dimension.
+ * @param sub        Vertex subset.
  *
- * @return Vertex with the lowest internal degree.
+ * @return Vertex with the lowest good-edge degree.
  */
 static Vertex *
-find_min_degree_vertex(PlannerInfo *root, List *sub)
+find_min_degree_vertex_cached(Selectivity *sel_cache, int nv, List *sub)
 {
 	int			best_deg = INT_MAX;
 	Vertex	   *best_v = NULL;
@@ -816,9 +822,9 @@ find_min_degree_vertex(PlannerInfo *root, List *sub)
 
 			if (list_member_ptr(sub, nbr))
 			{
-				Selectivity sel = get_selectivity(root, v->rel, nbr->rel);
+				Selectivity sel = sel_cache[v->index * nv + nbr->index];
 
-				if (sel <= border_selectivity)
+				if (sel >= 0 && sel <= border_selectivity)
 				{
 					deg++;
 				}
@@ -835,86 +841,216 @@ find_min_degree_vertex(PlannerInfo *root, List *sub)
 }
 
 /**
+ * @brief Attempt to peel a candidate vertex set down to a dense core.
+ *
+ * Iteratively removes the vertex with the lowest good-edge degree until
+ * the remaining subgraph has density >= THRESH, or the candidate becomes
+ * too small.
+ *
+ * @param sel_cache  Flat nv*nv selectivity matrix.
+ * @param nv         Cache dimension.
+ * @param candidate  List of Vertex* to peel (consumed — caller loses ownership).
+ *
+ * @return The peeled dense core (List of Vertex*), or NIL if peeling failed.
+ *         On failure the candidate list is freed.
+ */
+static List *
+peel_dense(Selectivity *sel_cache, int nv, List *candidate)
+{
+	while (list_length(candidate) >= 4)
+	{
+		Vertex	   *vmin = NULL;
+		double		cur_d = density_cached(sel_cache, nv, candidate);
+
+		if (cur_d >= THRESH)
+			return candidate;
+
+		vmin = find_min_degree_vertex_cached(sel_cache, nv, candidate);
+		if (vmin == NULL)
+			break;
+
+		candidate = list_delete_ptr(candidate, vmin);
+	}
+
+	/* Check once more after the loop exits (size may be exactly 4) */
+	if (list_length(candidate) >= 4 &&
+		density_cached(sel_cache, nv, candidate) >= THRESH)
+	{
+		return candidate;
+	}
+
+	list_free(candidate);
+	return NIL;
+}
+
+/**
  * @brief Find dense subgraphs and return them as topologies.
  *
- * Iteratively prunes low-degree vertices until density exceeds threshold.
+ * Builds a selectivity cache once for the entire component,
+ * then on each iteration splits unused vertices into connected
+ * components using only good edges (sel <= border_selectivity)
+ * and tries to peel each component independently.
  *
- * @param root Planner context.
- * @param vertexes Join graph vertices.
- * @param used Used marker array.
+ * This avoids the bug where a single failed peeling of the full
+ * unused vertex set prevents discovery of dense subgraphs that
+ * exist in independent sub-components of the graph.
+ *
+ * @param root     Planner context.
+ * @param vertexes Join graph vertices (indices must be 0..nv-1).
+ * @param used     Used marker array (size >= nv, updated in-place).
  *
  * @return List of DENSITY_GRAPH topologies.
  */
 List *
 find_dense_subgraphs(PlannerInfo *root, List *vertexes, bool *used)
 {
-	List	   *dense_sets = NIL;	/* List* of Topology* */
+	List	   *dense_sets = NIL;
+	int			nv = list_length(vertexes);
+	Selectivity *sel_cache;
+	ListCell   *lc;
 
+	/*
+	 * Build selectivity cache — one get_selectivity() call per edge,
+	 * instead of n * edges calls during repeated density/peeling passes. -1.0
+	 * = no adjacency between these vertices.
+	 */
+	sel_cache = (Selectivity *) palloc(nv * nv * sizeof(Selectivity));
+	for (int i = 0; i < nv * nv; i++)
+		sel_cache[i] = -1.0;
+
+	foreach(lc, vertexes)
+	{
+		Vertex	   *v1 = (Vertex *) lfirst(lc);
+		ListCell   *lc2;
+
+		foreach(lc2, v1->adj)
+		{
+			Vertex	   *v2 = (Vertex *) lfirst(lc2);
+
+			if (v1->index < v2->index)
+			{
+				Selectivity s = get_selectivity(root, v1->rel, v2->rel);
+
+				sel_cache[v1->index * nv + v2->index] = s;
+				sel_cache[v2->index * nv + v1->index] = s;
+			}
+		}
+	}
+
+	/*
+	 * Main loop: on each iteration, collect unused vertices, split them into
+	 * connected components (good-edge-only), and try peeling each. Re-enter
+	 * only if at least one dense subgraph was found (remaining fragments of a
+	 * large component may form new dense cores).
+	 */
 	while (true)
 	{
-		List	   *candidate = NIL;
-		ListCell   *lc = NULL;
-		Topology   *topology = NULL;
-		double		final_density;
+		List	   *all_unused = NIL;
+		bool	   *comp_visited;
+		bool		found_any = false;
 
 		foreach(lc, vertexes)
 		{
 			Vertex	   *v = (Vertex *) lfirst(lc);
 
 			if (!used[v->index])
-			{
-				candidate = lappend(candidate, v);
-			}
+				all_unused = lappend(all_unused, v);
 		}
 
-		if (list_length(candidate) < 4)
+		if (list_length(all_unused) < 4)
 		{
-			list_free(candidate);
+			list_free(all_unused);
 			break;
 		}
 
-		while (list_length(candidate) >= 4)
+		/*
+		 * Split unused vertices into connected components, following only
+		 * "good" edges (sel <= border_selectivity).  This ensures that two
+		 * clusters connected only by near-Cartesian joins are treated
+		 * independently.
+		 */
+		comp_visited = (bool *) palloc0(nv * sizeof(bool));
+		for (int i = 0; i < nv; i++)
+			comp_visited[i] = used[i];
+
+		foreach(lc, all_unused)
 		{
-			Vertex	   *vmin = NULL;
-			double		cur_density = density(root, candidate);
+			Vertex	   *start = (Vertex *) lfirst(lc);
+			List	   *component;
+			List	   *dense_core;
+			int			begin_q;
+			ListCell   *lc2;
 
-			if (cur_density >= THRESH)
+			if (comp_visited[start->index])
+				continue;
+
+			/* BFS: follow only edges with selectivity <= border_selectivity */
+			comp_visited[start->index] = true;
+			component = list_make1(start);
+			begin_q = 0;
+
+			while (begin_q < list_length(component))
 			{
-				break;
+				Vertex	   *v = (Vertex *) lfirst(list_nth_cell(component, begin_q));
+
+				begin_q++;
+				foreach(lc2, v->adj)
+				{
+					Vertex	   *nbr = (Vertex *) lfirst(lc2);
+					Selectivity s;
+
+					if (comp_visited[nbr->index])
+						continue;
+
+					s = sel_cache[v->index * nv + nbr->index];
+					if (s >= 0 && s <= border_selectivity)
+					{
+						comp_visited[nbr->index] = true;
+						component = lappend(component, nbr);
+					}
+				}
 			}
 
-			vmin = find_min_degree_vertex(root, candidate);
-			if (vmin == NULL)
+			if (list_length(component) < 4)
 			{
-				break;
+				list_free(component);
+				continue;
 			}
 
-			candidate = list_delete_ptr(candidate, vmin);
+			/* Try peeling this connected component to a dense core. */
+			dense_core = peel_dense(sel_cache, nv, list_copy(component));
+			list_free(component);
+
+			if (dense_core != NIL)
+			{
+				Topology   *topology = (Topology *) palloc0(sizeof(Topology));
+
+				topology->vertexes = dense_core;
+				topology->form = DENSITY_GRAPH;
+				set_id(root, topology);
+				set_sel_topology(root, topology);
+				set_vol_topology(root, topology);
+				set_complexity_topology(root, topology);
+				dense_sets = lappend(dense_sets, topology);
+
+				foreach(lc2, dense_core)
+				{
+					Vertex	   *v = (Vertex *) lfirst(lc2);
+
+					used[v->index] = true;
+				}
+				found_any = true;
+			}
 		}
 
-		final_density = density(root, candidate);
-		if (list_length(candidate) < 4 || final_density < THRESH)
-		{
-			list_free(candidate);
+		pfree(comp_visited);
+		list_free(all_unused);
+
+		if (!found_any)
 			break;
-		}
-		topology = (Topology *) palloc0(sizeof(Topology));
-		topology->vertexes = candidate;
-		topology->form = DENSITY_GRAPH;
-		set_id(root, topology);
-		set_sel_topology(root, topology);
-		set_vol_topology(root, topology);
-		set_complexity_topology(root, topology);
-		dense_sets = lappend(dense_sets, topology);
-		/* print_topology(topology); */
-		foreach(lc, candidate)
-		{
-			Vertex	   *v = (Vertex *) lfirst(lc);
-
-			used[v->index] = true;
-		}
 	}
 
+	pfree(sel_cache);
 	return dense_sets;
 }
 
@@ -966,29 +1102,53 @@ set_complexity_topology(PlannerInfo *root, Topology * topology)
  */
 Selectivity
 get_selectivity(PlannerInfo *root, RelOptInfo *rel1,
-				RelOptInfo *rel2)
+                RelOptInfo *rel2)
 {
-	RelOptInfo	joinrel = {0};
-	SpecialJoinInfo sjinfo;
-	List	   *clauses;
-	Selectivity result;
+    RelOptInfo      joinrel = {0};
+    SpecialJoinInfo sjinfo;
+    List           *clauses;
+    List           *unique_clauses = NIL;
+    Selectivity     result;
+    Relids          base_relids = bms_union(rel1->relids, rel2->relids);
+    List           *seen_ecs = NIL;
+    ListCell       *lc;
 
-	Relids		base_relids = bms_union(rel1->relids, rel2->relids);
+    init_dummy_sjinfo(&sjinfo, rel1->relids, rel2->relids);
+    joinrel.relids =
+        add_outer_joins_to_relids(root, base_relids, &sjinfo, NULL);
+    clauses =
+        build_joinrel_restrictlist(root, &joinrel, rel1, rel2, &sjinfo);
 
-	init_dummy_sjinfo(&sjinfo, rel1->relids, rel2->relids);
-	joinrel.relids =
-		add_outer_joins_to_relids(root, base_relids, &sjinfo, NULL);
-	clauses =
-		build_joinrel_restrictlist(root, &joinrel, rel1, rel2, &sjinfo);
+    /*
+     * Deduplicate clauses that belong to the same EquivalenceClass.
+     * When rel1 is composite (e.g., {1,4,6} joined on t1.id=t4.id=t6.id),
+     * joining with rel2 on t1.id=t2.id AND t4.id=t2.id AND t6.id=t2.id
+     * produces three clauses that are functionally redundant.
+     * They all share the same EquivalenceClass.  Keep only one per EC.
+     */
+    foreach(lc, clauses)
+    {
+        RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
-	result =
-		clauselist_selectivity(root, clauses, 0, JOIN_INNER, &sjinfo);
-	if (joinrel.relids != base_relids)
-	{
-		bms_free(base_relids);
-	}
-	bms_free(joinrel.relids);
-	return result;
+        if (rinfo->parent_ec != NULL)
+        {
+            if (list_member_ptr(seen_ecs, rinfo->parent_ec))
+                continue;           /* redundant — same EC already counted */
+
+            seen_ecs = lappend(seen_ecs, rinfo->parent_ec);
+        }
+        unique_clauses = lappend(unique_clauses, rinfo);
+    }
+
+    result = clauselist_selectivity(root, unique_clauses, 0,
+                                    JOIN_INNER, &sjinfo);
+
+    list_free(seen_ecs);
+    list_free(unique_clauses);
+    if (joinrel.relids != base_relids)
+        bms_free(base_relids);
+    bms_free(joinrel.relids);
+    return result;
 }
 
 /**
@@ -1093,7 +1253,6 @@ cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 		List	   *mergeclauses = NIL;
 		SpecialJoinInfo sjinfo;
 		RelOptInfo	joinrel = {0};
-
 		List	   *restrictlist = NIL;
 		ListCell   *lc = NULL;
 		Relids		base_relids = NULL;
@@ -1105,26 +1264,21 @@ cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 			continue;
 		}
 		base_relids = bms_union(outer_rel->relids, inner_rel->relids);
-
 		init_dummy_sjinfo(&sjinfo, outer_rel->relids, inner_rel->relids);
 		joinrel.relids = add_outer_joins_to_relids(root, base_relids, &sjinfo, NULL);
-
 		restrictlist = build_joinrel_restrictlist(root, &joinrel, outer_rel,
 												  inner_rel, &sjinfo);
-
 		extra.restrictlist = restrictlist;
 		extra.mergeclause_list = NIL;
 		extra.inner_unique = false;
 		extra.sjinfo = &sjinfo;
 		extra.param_source_rels = joinrel.relids;
-
 		initial_cost_nestloop(root, &workspace, JOIN_INNER, outer_path, inner_path,
 							  &extra);
 		if (workspace.total_cost < min_cost)
 		{
 			min_cost = workspace.total_cost;
 		}
-
 		foreach(lc, restrictlist)
 		{
 			RestrictInfo *restrictinfo = (RestrictInfo *) lfirst(lc);
@@ -1134,23 +1288,19 @@ cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 			{
 				continue;
 			}
-
 			if (!clause_sides_match_join(restrictinfo, outer_rel->relids,
 										 inner_rel->relids))
 			{
 				continue;
 			}
-
 			if (!restrictinfo->outer_is_left &&
 				!OidIsValid(
 							get_commutator(castNode(OpExpr, restrictinfo->clause)->opno)))
 			{
 				continue;
 			}
-
 			hashclauses = lappend(hashclauses, restrictinfo);
 		}
-
 		if (hashclauses != NIL)
 		{
 			initial_cost_hashjoin(root, &workspace, JOIN_INNER, hashclauses,
@@ -1160,10 +1310,8 @@ cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 				min_cost = workspace.total_cost;
 			}
 		}
-
 		mergeclauses = find_mergeclauses_for_outer_pathkeys(
 															root, outer_path->pathkeys, restrictlist);
-
 		if (mergeclauses != NIL)
 		{
 			List	   *outersortkeys = outer_path->pathkeys;
@@ -1181,7 +1329,6 @@ cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 			{
 				outersortkeys = NIL;
 			}
-
 			if (innersortkeys &&
 				pathkeys_contained_in(innersortkeys, inner_path->pathkeys))
 			{
@@ -1199,7 +1346,6 @@ cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 			bms_free(base_relids);
 		bms_free(joinrel.relids);
 	}
-
 	return min_cost;
 }
 

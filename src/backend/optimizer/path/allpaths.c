@@ -13,12 +13,16 @@
  *-------------------------------------------------------------------------
  */
 
-#include "optimizer/heuristic/heuristic_manager.h"
-#include "nodes/pg_list.h"
 #include "postgres.h"
-
+#include "nodes/pg_list.h"
+#include "optimizer/heuristic/graph_utils.h"
+#include "optimizer/heuristic/heuristic_manager.h"
+#include "optimizer/heuristic/goo.h"
+#include <float.h>
 #include <limits.h>
 #include <math.h>
+#include <stdbool.h>
+#include <string.h>
 
 #include "access/sysattr.h"
 #include "access/tsmapi.h"
@@ -3611,7 +3615,9 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		return (RelOptInfo *) linitial(initial_rels);
 	}
 	else
-	{
+	{	
+		RelOptInfo* res = NULL;
+		List* partial_plans=NIL;
 		/*
 		 * Consider the different orders in which we could join the rels,
 		 * using a plugin, GEQO, or the regular join search code.
@@ -3620,16 +3626,19 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		 * has_legal_joinclause() needs to look at it (ugly :-().
 		 */
 		root->initial_rels = initial_rels;
-		return heuristic_join_search(root, initial_rels);
-		/* return geqo(root, levels_needed, initial_rels, NIL); */
+		root->topology_budget=DBL_MAX;
+		root->spent_budget=0;
+		//partial_plans = dummy(root, initial_rels);
+		res = heuristic_join_search( root, initial_rels);
+		/* res = geqo(root, levels_needed, initial_rels); */
+		
+		/* root->topology_budget=DBL_MAX;*/
+		/* root->spent_budget=0;*/
+		/* partial_plans= standard_join_search(root, levels_needed, initial_rels);*/
+		/* res = (RelOptInfo *) linitial(partial_plans); */
+		//print_trace(res);
+		return(res);
 
-		/*
-		 * if (join_search_hook) { return (*join_search_hook)(root,
-		 * levels_needed, initial_rels); } else if (enable_geqo &&
-		 * levels_needed >= geqo_threshold) { return geqo(root, levels_needed,
-		 * initial_rels,NIL); } else { return standard_join_search(root,
-		 * levels_needed, initial_rels); }
-		 */
 	}
 }
 
