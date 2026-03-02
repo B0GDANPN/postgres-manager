@@ -3615,9 +3615,10 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		return (RelOptInfo *) linitial(initial_rels);
 	}
 	else
-	{	
-		RelOptInfo* res = NULL;
-		List* partial_plans=NIL;
+	{
+		RelOptInfo *res = NULL;
+		List	   *partial_plans = NIL;
+
 		/*
 		 * Consider the different orders in which we could join the rels,
 		 * using a plugin, GEQO, or the regular join search code.
@@ -3626,18 +3627,23 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		 * has_legal_joinclause() needs to look at it (ugly :-().
 		 */
 		root->initial_rels = initial_rels;
-		root->topology_budget=DBL_MAX;
-		root->spent_budget=0;
-		//partial_plans = dummy(root, initial_rels);
-		res = heuristic_join_search( root, initial_rels);
+		root->topology_budget = DBL_MAX;
+		root->spent_budget = 0;
+		/* partial_plans = dummy(root, initial_rels); */
+		res = heuristic_join_search(root, initial_rels);
+		print_trace(res);
 		/* res = geqo(root, levels_needed, initial_rels); */
-		
-		/* root->topology_budget=DBL_MAX;*/
-		/* root->spent_budget=0;*/
-		/* partial_plans= standard_join_search(root, levels_needed, initial_rels);*/
+
+		/* root->topology_budget=DBL_MAX; */
+		/* root->spent_budget=0; */
+
+		/*
+		 * partial_plans= standard_join_search(root, levels_needed,
+		 * initial_rels);
+		 */
 		/* res = (RelOptInfo *) linitial(partial_plans); */
-		//print_trace(res);
-		return(res);
+		/* print_trace(res); */
+		return (res);
 
 	}
 }

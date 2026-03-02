@@ -42,6 +42,7 @@ extern void set_id(PlannerInfo *root, Topology * topology);
 extern void set_sel_topology(PlannerInfo *root, Topology * topology);
 extern void set_vol_topology(PlannerInfo *root, Topology * topology);
 extern Cost cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2);
+extern RelOptInfo *make_rel(PlannerInfo *root, RelOptInfo *left, RelOptInfo *right);
 extern void print_topology(Topology * topology);
 extern void print_trace(RelOptInfo *rel);
 void free_join_graph(List *graph);

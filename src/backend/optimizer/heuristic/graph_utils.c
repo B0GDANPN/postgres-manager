@@ -54,10 +54,8 @@ static List *peel_dense(Selectivity *sel_cache, int nv, List *candidate);
 bool
 has_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 {
-	bool		a = bms_overlap(rel1->relids, rel2->relids);
-	bool		b = have_relevant_joinclause(root, rel1, rel2);
-	bool		c = have_join_order_restriction(root, rel1, rel2);
-	bool		result = !a && (b || c);
+	bool		result = !bms_overlap(rel1->relids, rel2->relids) &&
+		(have_relevant_joinclause(root, rel1, rel2) || have_join_order_restriction(root, rel1, rel2));
 
 	return result;
 }
@@ -258,7 +256,7 @@ build_join_graph(PlannerInfo *root, List *initial_rels)
 			}
 		}
 	}
-	//print_graph(root, vertexes);
+	/* print_graph(root, vertexes); */
 	return vertexes;
 }
 
@@ -329,10 +327,10 @@ split_components(PlannerInfo *root, List *vertexes)
 
 			component->vertexes = sub;
 			component->form = COMPONENT;
-			set_id(root, component);
+			/*set_id(root, component);
 			set_sel_topology(root, component);
 			set_vol_topology(root, component);
-			set_complexity_topology(root, component);
+			set_complexity_topology(root, component);*/
 			comps = lappend(comps, component);
 		}
 	}
@@ -507,10 +505,10 @@ find_cycles(PlannerInfo *root, List *vertexes, bool *used_vertexes_comp)
 
 		topology->vertexes = cycle;
 		topology->form = CYCLE;
-		set_id(root, topology);
+		/*set_id(root, topology);
 		set_sel_topology(root, topology);
 		set_vol_topology(root, topology);
-		set_complexity_topology(root, topology);
+		set_complexity_topology(root, topology);*/
 		cyclic_topologies = lappend(cyclic_topologies, topology);
 		/* print_topology(topology); */
 	}
@@ -529,29 +527,27 @@ find_cycles(PlannerInfo *root, List *vertexes, bool *used_vertexes_comp)
  * @return True if the vertex qualifies as a star center.
  */
 static bool
-is_star(Vertex * center, const bool *used_vertexes)
+is_star(Vertex *center, const bool *used_vertexes)
 {
-	int			count_unused_neighbors = 0;
-	int			count_light_neighbors = 0;
-	double		volume_center = center->rel->rows;
+    double center_rows = center->rel->rows;
+    int count_unused = 0;
+    double sum_neighbor_rows = 0;
 	ListCell   *lc = NULL;
-
-	foreach(lc, center->adj)
-	{
-		Vertex	   *neighbor = (Vertex *) lfirst(lc);
-
-		if (!used_vertexes[neighbor->index])
-		{
-			double		volume_neighbor = neighbor->rel->rows;
-
-			if (volume_center >= 10 * volume_neighbor)
-			{
-				count_light_neighbors++;
-			}
-			count_unused_neighbors++;
-		}
-	}
-	return count_unused_neighbors >= 3 || count_light_neighbors >= 2;
+    foreach(lc, center->adj) {
+        Vertex *nbr = lfirst(lc);
+        if (!used_vertexes[nbr->index]) {
+            count_unused++;
+            sum_neighbor_rows += nbr->rel->rows;
+        }
+    }
+    
+    if (count_unused < 3)
+        return false;
+    
+    if (center_rows > sum_neighbor_rows / count_unused)
+        return false;
+    
+    return true;
 }
 
 /**
@@ -651,10 +647,10 @@ find_chains(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 
 			topology->vertexes = sub;
 			topology->form = CHAIN;
-			set_id(root, topology);
+			/*set_id(root, topology);
 			set_sel_topology(root, topology);
 			set_vol_topology(root, topology);
-			set_complexity_topology(root, topology);
+			set_complexity_topology(root, topology);*/
 			chains = lappend(chains, topology);
 		}
 	}
@@ -696,10 +692,10 @@ find_stars(PlannerInfo *root, List *vertexes, bool *used_vertexes)
 		topology->vertexes = star;
 		topology->form = STAR;
 		topology->extended_info = chains;
-		set_id(root, topology);
+		/*set_id(root, topology);
 		set_sel_topology(root, topology);
 		set_vol_topology(root, topology);
-		set_complexity_topology(root, topology);
+		set_complexity_topology(root, topology);*/
 		stars = lappend(stars, topology);
 		/* print_topology(topology); */
 	}
@@ -1027,10 +1023,10 @@ find_dense_subgraphs(PlannerInfo *root, List *vertexes, bool *used)
 
 				topology->vertexes = dense_core;
 				topology->form = DENSITY_GRAPH;
-				set_id(root, topology);
+				/*set_id(root, topology);
 				set_sel_topology(root, topology);
 				set_vol_topology(root, topology);
-				set_complexity_topology(root, topology);
+				set_complexity_topology(root, topology);*/
 				dense_sets = lappend(dense_sets, topology);
 
 				foreach(lc2, dense_core)
@@ -1102,53 +1098,53 @@ set_complexity_topology(PlannerInfo *root, Topology * topology)
  */
 Selectivity
 get_selectivity(PlannerInfo *root, RelOptInfo *rel1,
-                RelOptInfo *rel2)
+				RelOptInfo *rel2)
 {
-    RelOptInfo      joinrel = {0};
-    SpecialJoinInfo sjinfo;
-    List           *clauses;
-    List           *unique_clauses = NIL;
-    Selectivity     result;
-    Relids          base_relids = bms_union(rel1->relids, rel2->relids);
-    List           *seen_ecs = NIL;
-    ListCell       *lc;
+	RelOptInfo	joinrel = {0};
+	SpecialJoinInfo sjinfo;
+	List	   *clauses;
+	List	   *unique_clauses = NIL;
+	Selectivity result;
+	Relids		base_relids = bms_union(rel1->relids, rel2->relids);
+	List	   *seen_ecs = NIL;
+	ListCell   *lc;
 
-    init_dummy_sjinfo(&sjinfo, rel1->relids, rel2->relids);
-    joinrel.relids =
-        add_outer_joins_to_relids(root, base_relids, &sjinfo, NULL);
-    clauses =
-        build_joinrel_restrictlist(root, &joinrel, rel1, rel2, &sjinfo);
+	init_dummy_sjinfo(&sjinfo, rel1->relids, rel2->relids);
+	joinrel.relids =
+		add_outer_joins_to_relids(root, base_relids, &sjinfo, NULL);
+	clauses =
+		build_joinrel_restrictlist(root, &joinrel, rel1, rel2, &sjinfo);
 
-    /*
-     * Deduplicate clauses that belong to the same EquivalenceClass.
-     * When rel1 is composite (e.g., {1,4,6} joined on t1.id=t4.id=t6.id),
-     * joining with rel2 on t1.id=t2.id AND t4.id=t2.id AND t6.id=t2.id
-     * produces three clauses that are functionally redundant.
-     * They all share the same EquivalenceClass.  Keep only one per EC.
-     */
-    foreach(lc, clauses)
-    {
-        RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+	/*
+	 * Deduplicate clauses that belong to the same EquivalenceClass. When rel1
+	 * is composite (e.g., {1,4,6} joined on t1.id=t4.id=t6.id), joining with
+	 * rel2 on t1.id=t2.id AND t4.id=t2.id AND t6.id=t2.id produces three
+	 * clauses that are functionally redundant. They all share the same
+	 * EquivalenceClass.  Keep only one per EC.
+	 */
+	foreach(lc, clauses)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
-        if (rinfo->parent_ec != NULL)
-        {
-            if (list_member_ptr(seen_ecs, rinfo->parent_ec))
-                continue;           /* redundant — same EC already counted */
+		if (rinfo->parent_ec != NULL)
+		{
+			if (list_member_ptr(seen_ecs, rinfo->parent_ec))
+				continue;		/* redundant — same EC already counted */
 
-            seen_ecs = lappend(seen_ecs, rinfo->parent_ec);
-        }
-        unique_clauses = lappend(unique_clauses, rinfo);
-    }
+			seen_ecs = lappend(seen_ecs, rinfo->parent_ec);
+		}
+		unique_clauses = lappend(unique_clauses, rinfo);
+	}
 
-    result = clauselist_selectivity(root, unique_clauses, 0,
-                                    JOIN_INNER, &sjinfo);
+	result = clauselist_selectivity(root, unique_clauses, 0,
+									JOIN_INNER, &sjinfo);
 
-    list_free(seen_ecs);
-    list_free(unique_clauses);
-    if (joinrel.relids != base_relids)
-        bms_free(base_relids);
-    bms_free(joinrel.relids);
-    return result;
+	list_free(seen_ecs);
+	list_free(unique_clauses);
+	if (joinrel.relids != base_relids)
+		bms_free(base_relids);
+	bms_free(joinrel.relids);
+	return result;
 }
 
 /**
@@ -1238,7 +1234,6 @@ Cost
 cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 {
 	Cost		min_cost = DBL_MAX;
-	JoinPathExtraData extra = {0};
 	RelOptInfo *outer_rels[2] = {rel1, rel2};
 	RelOptInfo *inner_rels[2] = {rel2, rel1};
 
@@ -1249,103 +1244,130 @@ cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 		Path	   *outer_path = outer_rel->cheapest_total_path;
 		Path	   *inner_path = inner_rel->cheapest_total_path;
 		JoinCostWorkspace workspace;
-		List	   *hashclauses = NIL;
-		List	   *mergeclauses = NIL;
+		JoinPathExtraData extra = {0};
 		SpecialJoinInfo sjinfo;
 		RelOptInfo	joinrel = {0};
 		List	   *restrictlist = NIL;
+		List	   *hashclauses = NIL;
+		List	   *merge_candidates = NIL;
+		List	   *mergeclauses = NIL;
 		ListCell   *lc = NULL;
 		Relids		base_relids = NULL;
 
-		/* memset(&joinrel, 0, sizeof(RelOptInfo)); */
 		if (PATH_PARAM_BY_REL(outer_path, inner_rel) ||
 			PATH_PARAM_BY_REL(inner_path, outer_rel))
 		{
 			continue;
 		}
+
 		base_relids = bms_union(outer_rel->relids, inner_rel->relids);
+
 		init_dummy_sjinfo(&sjinfo, outer_rel->relids, inner_rel->relids);
-		joinrel.relids = add_outer_joins_to_relids(root, base_relids, &sjinfo, NULL);
+		joinrel.relids =
+			add_outer_joins_to_relids(root, base_relids, &sjinfo, NULL);
+
 		restrictlist = build_joinrel_restrictlist(root, &joinrel, outer_rel,
 												  inner_rel, &sjinfo);
+
 		extra.restrictlist = restrictlist;
 		extra.mergeclause_list = NIL;
 		extra.inner_unique = false;
 		extra.sjinfo = &sjinfo;
 		extra.param_source_rels = joinrel.relids;
-		initial_cost_nestloop(root, &workspace, JOIN_INNER, outer_path, inner_path,
-							  &extra);
+
+		/* ---- Nestloop ---- */
+		initial_cost_nestloop(root, &workspace, JOIN_INNER,
+							  outer_path, inner_path, &extra);
 		if (workspace.total_cost < min_cost)
-		{
 			min_cost = workspace.total_cost;
-		}
+
+		/* ---- Hashjoin ---- */
 		foreach(lc, restrictlist)
 		{
-			RestrictInfo *restrictinfo = (RestrictInfo *) lfirst(lc);
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
-			if (!restrictinfo->can_join ||
-				restrictinfo->hashjoinoperator == InvalidOid)
-			{
+			if (!rinfo->can_join ||
+				rinfo->hashjoinoperator == InvalidOid)
 				continue;
-			}
-			if (!clause_sides_match_join(restrictinfo, outer_rel->relids,
+
+			if (!clause_sides_match_join(rinfo, outer_rel->relids,
 										 inner_rel->relids))
-			{
 				continue;
-			}
-			if (!restrictinfo->outer_is_left &&
+
+			if (!rinfo->outer_is_left &&
 				!OidIsValid(
-							get_commutator(castNode(OpExpr, restrictinfo->clause)->opno)))
-			{
+							get_commutator(castNode(OpExpr,
+													rinfo->clause)->opno)))
 				continue;
-			}
-			hashclauses = lappend(hashclauses, restrictinfo);
+
+			hashclauses = lappend(hashclauses, rinfo);
 		}
+
 		if (hashclauses != NIL)
 		{
-			initial_cost_hashjoin(root, &workspace, JOIN_INNER, hashclauses,
-								  outer_path, inner_path, &extra, false);
+			initial_cost_hashjoin(root, &workspace, JOIN_INNER,
+								  hashclauses, outer_path, inner_path,
+								  &extra, false);
 			if (workspace.total_cost < min_cost)
-			{
 				min_cost = workspace.total_cost;
-			}
 		}
-		mergeclauses = find_mergeclauses_for_outer_pathkeys(
-															root, outer_path->pathkeys, restrictlist);
+
+		/* ---- Mergejoin ---- */
+
+		/*
+		 * Pre-filter: only clauses with mergeopfamilies can participate
+		 * in a merge join.  find_mergeclauses_for_outer_pathkeys() calls
+		 * update_mergeclause_eclasses() which asserts mergeopfamilies != NIL,
+		 * so passing unfiltered restrictlist causes an assertion failure.
+		 */
+		foreach(lc, restrictlist)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+			if (rinfo->mergeopfamilies != NIL)
+				merge_candidates = lappend(merge_candidates, rinfo);
+		}
+
+		if (merge_candidates != NIL)
+		{
+			mergeclauses = find_mergeclauses_for_outer_pathkeys(
+															   root, outer_path->pathkeys,
+															   merge_candidates);
+		}
+
 		if (mergeclauses != NIL)
 		{
 			List	   *outersortkeys = outer_path->pathkeys;
 			List	   *innersortkeys =
-				make_inner_pathkeys_for_merge(root, mergeclauses, outersortkeys);
+				make_inner_pathkeys_for_merge(root, mergeclauses,
+											  outersortkeys);
 
-			/*
-			 * Callers are expected to clear the explicit sort keys when the
-			 * input path is already ordered.  Be forgiving here in case a
-			 * caller forgets to do so and avoid redundant work instead of
-			 * tripping the assertion below.
-			 */
 			if (outersortkeys &&
 				pathkeys_contained_in(outersortkeys, outer_path->pathkeys))
-			{
 				outersortkeys = NIL;
-			}
+
 			if (innersortkeys &&
 				pathkeys_contained_in(innersortkeys, inner_path->pathkeys))
-			{
 				innersortkeys = NIL;
-			}
-			initial_cost_mergejoin(root, &workspace, JOIN_INNER, mergeclauses,
-								   outer_path, inner_path, outersortkeys,
-								   innersortkeys, 0, &extra);
+
+			initial_cost_mergejoin(root, &workspace, JOIN_INNER,
+								   mergeclauses, outer_path, inner_path,
+								   outersortkeys, innersortkeys, 0,
+								   &extra);
 			if (workspace.total_cost < min_cost)
-			{
 				min_cost = workspace.total_cost;
-			}
 		}
+
+		/* Cleanup */
+		list_free(hashclauses);
+		list_free(merge_candidates);
+		list_free(mergeclauses);
+
 		if (joinrel.relids != base_relids)
 			bms_free(base_relids);
 		bms_free(joinrel.relids);
 	}
+
 	return min_cost;
 }
 
@@ -1385,4 +1407,24 @@ free_join_graph(List *graph)
 		pfree(v);
 	}
 	list_free(graph);
+}
+
+
+RelOptInfo *
+make_rel(PlannerInfo *root, RelOptInfo *left, RelOptInfo *right)
+{
+	RelOptInfo *joinrel = make_join_rel(root, left, right);
+
+	if (joinrel)
+	{
+		generate_partitionwise_join_paths(root, joinrel);
+		if (!bms_equal(joinrel->relids, root->all_query_rels))
+		{
+			generate_useful_gather_paths(root, joinrel, false);
+		}
+		set_cheapest(joinrel);
+	}
+
+	return joinrel;
+
 }
