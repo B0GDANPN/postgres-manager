@@ -137,12 +137,27 @@ heuristic_join_search(PlannerInfo *root, List *initial_rels)
 			List	   *remaining_chains = NIL;
 			List	   *topology_plans = NIL;
 			ListCell   *lc2 = NULL;
+			bool       *anchor_mask = NULL;           /* NEW */
+    		int         nv;   
 
 			update_indices(component);
+			nv = list_length(component->vertexes);   
 			/* print_topology(component); */
 			used_vertexes =
 				(bool *) palloc0(list_length(component->vertexes) * sizeof(bool));
 
+			/* -------- Anchor zone protection -------- */
+			/* 
+			* Mark anchors + neighbours as "used" so that
+			* dense/star/cycle detectors do not tear them apart.
+			*/
+			mark_anchor_zones(component->vertexes, used_vertexes);
+
+			/* Save the anchor mask — we will restore these bits
+			* before find_chains() so they land in one component. */
+			anchor_mask = (bool *) palloc(nv * sizeof(bool));
+			memcpy(anchor_mask, used_vertexes, nv * sizeof(bool));
+			/* ---------------------------------------- */
 			dense_subgraphs = find_dense_subgraphs(root, component->vertexes, used_vertexes);
 			topologies = list_concat(topologies, dense_subgraphs);
 
@@ -151,6 +166,20 @@ heuristic_join_search(PlannerInfo *root, List *initial_rels)
 
 			cycles = find_cycles(root, component->vertexes, used_vertexes);
 			topologies = list_concat(topologies, cycles);
+
+			/* -------- Unmark anchor zones -------- */
+			/*
+			* Restore anchor vertices into the "unused" pool so that
+			* find_chains() collects them (and their neighbours)
+			* as a single connected BFS component.
+			*/
+			for (int i = 0; i < nv; i++)
+			{
+				if (anchor_mask[i])
+					used_vertexes[i] = false;
+			}
+			pfree(anchor_mask);
+			/* ------------------------------------- */
 
 			remaining_chains = find_chains(root, component->vertexes, used_vertexes);
 			topologies = list_concat(topologies, remaining_chains);
@@ -166,7 +195,7 @@ heuristic_join_search(PlannerInfo *root, List *initial_rels)
 				root->topology_budget = topology->budget;
 				plan = plan_topology(root, topology);
 
-				print_trace(plan);
+				/*print_trace(plan);*/
 
 				topology_plans = lappend(topology_plans, plan);
 				current_budget -= root->spent_budget;
@@ -182,9 +211,7 @@ heuristic_join_search(PlannerInfo *root, List *initial_rels)
 			}
 			else
 			{
-				free_join_graph(component->vertexes);	/* full cleanup of
-														 * build_join_graph
-														 * output */
+				free_join_graph(component->vertexes);
 			}
 			list_free(topologies);
 			component->vertexes = build_join_graph(root, topology_plans);

@@ -28,6 +28,7 @@ typedef struct Topology
 	void	   *extended_info;
 }			Topology;
 
+extern int mark_anchor_zones(List *vertexes, bool *used_vertexes);
 extern bool has_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2);
 extern bool is_connected(List *all_vertexes, size_t bitmap);
 extern List *build_join_graph(PlannerInfo *root, List *initial_rels);

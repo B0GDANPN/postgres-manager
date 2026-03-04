@@ -25,8 +25,25 @@
 static const uint64 dphyp_geqo_cc_threshold = 10000;
 static const double THRESH = 0.7;
 static const Selectivity border_selectivity = 0.26;
-static const int max_ray_length = 3;
+static const int max_ray_length = 5;
 static const int min_length_cycle = 3;
+
+/*
+ * Anchor zone protection.
+ *
+ * A vertex is an "anchor" when its estimated rows are tiny relative
+ * to its heaviest neighbour (dimension table with a selective filter
+ * next to a large fact table).  Separating an anchor from its
+ * neighbours during topology decomposition prevents the planner
+ * from building index-driven chains that start from the anchor.
+ *
+ * mark_anchor_zones() sets used_vertexes[i]=true for every anchor
+ * and all its immediate neighbours.  The caller must save/restore
+ * these bits so that find_chains() later picks them up as one
+ * connected component.
+ */
+static const double ANCHOR_RATIO   = 100.0;   /* rows < max_nbr / 100 */
+static const double ANCHOR_ABS_MAX = 50000.0;  /* absolute cap          */
 static void set_complexity_topology(PlannerInfo *root, Topology * topology);
 static List *bfs_component(Vertex * start, bool *used_vertexes);
 static bool dfs_cycle(PlannerInfo *root, Vertex * prev, Vertex * cur,
@@ -39,6 +56,99 @@ static Vertex * find_min_degree_vertex_cached(Selectivity *sel_cache, int nv, Li
 static double density_cached(Selectivity *sel_cache, int nv, List *sub);
 static int	count_edges_cached(Selectivity *sel_cache, int nv, List *sub);
 static List *peel_dense(Selectivity *sel_cache, int nv, List *candidate);
+
+
+
+/**
+ * @brief Mark anchor zones with 2-hop protection.
+ *
+ * An anchor is a vertex whose filtered rows are tiny relative to its
+ * heaviest neighbour.  We protect the anchor, its immediate neighbours
+ * (1-hop) and their neighbours (2-hop).  This ensures that topology
+ * detectors (dense, star, cycle) cannot separate the selective anchor
+ * from the join paths that exploit its selectivity.
+ *
+ * 2-hop is necessary because star/cycle detectors operate on the
+ * UNMARKED subgraph.  With only 1-hop protection, the anchor's
+ * neighbour-of-neighbour can become a star center and pull away
+ * tables that should be planned together with the anchor.
+ */
+int
+mark_anchor_zones(List *vertexes, bool *used_vertexes)
+{
+    int         marked = 0;
+    ListCell   *lc;
+    List       *hop1_vertices = NIL;  /* 1-hop neighbours to expand */
+
+    /* Pass 1: find anchors, mark them + their immediate neighbours */
+    foreach(lc, vertexes)
+    {
+        Vertex     *v = (Vertex *) lfirst(lc);
+        Cardinality max_nbr_rows = 0;
+        int         unused_nbrs = 0;
+        ListCell   *lc2;
+
+        if (used_vertexes[v->index])
+            continue;
+
+        foreach(lc2, v->adj)
+        {
+            Vertex *nbr = (Vertex *) lfirst(lc2);
+            if (!used_vertexes[nbr->index])
+            {
+                unused_nbrs++;
+                if (nbr->rel->rows > max_nbr_rows)
+                    max_nbr_rows = nbr->rel->rows;
+            }
+        }
+
+        if (unused_nbrs == 0)
+            continue;
+
+        if (v->rel->rows < ANCHOR_ABS_MAX &&
+            v->rel->rows * ANCHOR_RATIO < max_nbr_rows)
+        {
+            /* Mark anchor itself */
+            if (!used_vertexes[v->index])
+            {
+                used_vertexes[v->index] = true;
+                marked++;
+            }
+
+            /* Mark 1-hop neighbours and collect them for 2-hop */
+            foreach(lc2, v->adj)
+            {
+                Vertex *nbr = (Vertex *) lfirst(lc2);
+                if (!used_vertexes[nbr->index])
+                {
+                    used_vertexes[nbr->index] = true;
+                    marked++;
+                    hop1_vertices = lappend(hop1_vertices, nbr);
+                }
+            }
+        }
+    }
+
+    /* Pass 2: mark 2-hop (neighbours of 1-hop vertices) */
+    foreach(lc, hop1_vertices)
+    {
+        Vertex     *v = (Vertex *) lfirst(lc);
+        ListCell   *lc2;
+
+        foreach(lc2, v->adj)
+        {
+            Vertex *nbr = (Vertex *) lfirst(lc2);
+            if (!used_vertexes[nbr->index])
+            {
+                used_vertexes[nbr->index] = true;
+                marked++;
+            }
+        }
+    }
+
+    list_free(hop1_vertices);
+    return marked;
+}
 
 /**
  * @brief Check whether two relations have a legal simple join edge.
@@ -256,7 +366,7 @@ build_join_graph(PlannerInfo *root, List *initial_rels)
 			}
 		}
 	}
-	/* print_graph(root, vertexes); */
+	print_graph(root, vertexes);
 	return vertexes;
 }
 
@@ -617,44 +727,6 @@ find_star(PlannerInfo *root, Vertex * center, bool *used_vertexes,
 		*chains = lappend(*chains, chain);
 	}
 	return star;
-}
-
-/**
- * @brief Find chain components among unused vertices.
- *
- * Each connected component is treated as a chain topology.
- *
- * @param root Planner context.
- * @param vertexes Join graph vertices.
- * @param used_vertexes Used marker array.
- *
- * @return List of CHAIN topologies.
- */
-List *
-find_chains(PlannerInfo *root, List *vertexes, bool *used_vertexes)
-{
-	List	   *chains = NIL;	/* List* of Topology*  */
-	ListCell   *lc = NULL;
-
-	foreach(lc, vertexes)
-	{
-		Vertex	   *v = (Vertex *) lfirst(lc);
-
-		if (!used_vertexes[v->index])
-		{
-			List	   *sub = bfs_component(v, used_vertexes);
-			Topology   *topology = (Topology *) palloc0(sizeof(Topology));
-
-			topology->vertexes = sub;
-			topology->form = CHAIN;
-			/*set_id(root, topology);
-			set_sel_topology(root, topology);
-			set_vol_topology(root, topology);
-			set_complexity_topology(root, topology);*/
-			chains = lappend(chains, topology);
-		}
-	}
-	return chains;
 }
 
 /**
@@ -1427,4 +1499,109 @@ make_rel(PlannerInfo *root, RelOptInfo *left, RelOptInfo *right)
 
 	return joinrel;
 
+}
+
+/**
+ * @brief Check whether a list of vertices forms a true path graph.
+ *
+ * A path graph on n vertices has exactly n-1 edges (among vertices
+ * in the list) and every vertex has internal degree <= 2.
+ * Triangles or shortcut edges disqualify it.
+ *
+ * @param vertexes  List of Vertex* forming the subgraph.
+ * @return true if the subgraph is a genuine path (chain).
+ */
+static bool
+is_path_graph(List *vertexes)
+{
+    int     n = list_length(vertexes);
+    int     edge_count = 0;
+    bool   *in_sub = NULL;
+    int     max_idx = 0;
+    ListCell *lc;
+
+    if (n <= 2)
+        return true;    /* trivially a path */
+
+    /* Find max index for the membership array */
+    foreach(lc, vertexes)
+    {
+        Vertex *v = (Vertex *) lfirst(lc);
+        if ((int) v->index > max_idx)
+            max_idx = (int) v->index;
+    }
+
+    in_sub = (bool *) palloc0((max_idx + 1) * sizeof(bool));
+    foreach(lc, vertexes)
+    {
+        Vertex *v = (Vertex *) lfirst(lc);
+        in_sub[v->index] = true;
+    }
+
+    foreach(lc, vertexes)
+    {
+        Vertex *v = (Vertex *) lfirst(lc);
+        int     degree = 0;
+        ListCell *lc2;
+
+        foreach(lc2, v->adj)
+        {
+            Vertex *nbr = (Vertex *) lfirst(lc2);
+
+            if (in_sub[nbr->index])
+            {
+                degree++;
+                if (v->index < nbr->index)
+                    edge_count++;
+            }
+        }
+
+        if (degree > 2)
+        {
+            pfree(in_sub);
+            return false;
+        }
+    }
+
+    pfree(in_sub);
+    return (edge_count == n - 1);
+}
+
+
+/**
+ * @brief Find chain components among unused vertices.
+ *
+ * Each connected component is treated as a chain topology.
+ *
+ * @param root Planner context.
+ * @param vertexes Join graph vertices.
+ * @param used_vertexes Used marker array.
+ *
+ * @return List of CHAIN topologies.
+ */
+List *
+find_chains(PlannerInfo *root, List *vertexes, bool *used_vertexes)
+{
+	List	   *chains = NIL;	/* List* of Topology*  */
+	ListCell   *lc = NULL;
+
+	foreach(lc, vertexes)
+	{
+		Vertex	   *v = (Vertex *) lfirst(lc);
+
+		if (!used_vertexes[v->index])
+		{
+			List	   *sub = bfs_component(v, used_vertexes);
+			Topology   *topology = (Topology *) palloc0(sizeof(Topology));
+
+			topology->vertexes = sub;
+			topology->form = is_path_graph(sub) ? CHAIN : DENSITY_GRAPH;;
+			/*set_id(root, topology);
+			set_sel_topology(root, topology);
+			set_vol_topology(root, topology);
+			set_complexity_topology(root, topology);*/
+			chains = lappend(chains, topology);
+		}
+	}
+	return chains;
 }
