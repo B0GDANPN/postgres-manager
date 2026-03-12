@@ -17,7 +17,6 @@
 #include "nodes/pg_list.h"
 #include "optimizer/heuristic/graph_utils.h"
 #include "optimizer/heuristic/heuristic_manager.h"
-#include "optimizer/heuristic/goo.h"
 #include <float.h>
 #include <limits.h>
 #include <math.h>
@@ -3631,7 +3630,7 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		root->spent_budget = 0;
 		/* partial_plans = dummy(root, initial_rels); */
 		res = heuristic_join_search(root, initial_rels);
-		print_trace(res);
+		/* print_trace(res); */
 		/* res = geqo(root, levels_needed, initial_rels); */
 
 		/* root->topology_budget=DBL_MAX; */
