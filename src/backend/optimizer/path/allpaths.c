@@ -12,12 +12,10 @@
  *
  *-------------------------------------------------------------------------
  */
-
 #include "postgres.h"
+#include "nodes/pathnodes.h"
 #include "nodes/pg_list.h"
-#include "optimizer/heuristic/graph_utils.h"
 #include "optimizer/heuristic/heuristic_manager.h"
-#include "optimizer/heuristic/goo.h"
 #include <float.h>
 #include <limits.h>
 #include <math.h>
@@ -3627,11 +3625,10 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		 * has_legal_joinclause() needs to look at it (ugly :-().
 		 */
 		root->initial_rels = initial_rels;
-		root->topology_budget = DBL_MAX;
-		root->spent_budget = 0;
 		/* partial_plans = dummy(root, initial_rels); */
 		res = heuristic_join_search(root, initial_rels);
-		print_trace(res);
+		/* print_trace(res); */
+		/* print_trace(res); */
 		/* res = geqo(root, levels_needed, initial_rels); */
 
 		/* root->topology_budget=DBL_MAX; */
@@ -3677,12 +3674,11 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
  * than one join-order search, you'll probably need to save and restore the
  * original states of those data structures.  See geqo_eval() for an example.
  */
-List *
+RelOptInfo *
 standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 {
 	int			lev;
 	RelOptInfo *rel;
-	List	   *result = NIL;
 
 	/*
 	 * This function cannot be invoked recursively within any one planning
@@ -3714,7 +3710,7 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 		 * level, and build paths for making each one from every available
 		 * pair of lower-level relations.
 		 */
-		bool		done = join_search_one_level(root, lev);
+		join_search_one_level(root, lev);
 
 		/*
 		 * Run generate_partitionwise_join_paths() and
@@ -3740,9 +3736,7 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 			 * its call to apply_scanjoin_target_to_paths).
 			 */
 			if (!bms_equal(rel->relids, root->all_query_rels))
-			{
 				generate_useful_gather_paths(root, rel, false);
-			}
 
 			/* Find and save the cheapest paths for this rel */
 			set_cheapest(rel);
@@ -3751,31 +3745,20 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 			pprint(rel);
 #endif
 		}
-		if (!done)
-		{
-			List	   *partial_plans = root->join_rel_level[lev - 1];
-
-			partial_plans = list_concat(partial_plans, root->join_rel_level[lev]);
-			root->join_rel_level = NULL;
-			return partial_plans;
-		}
 	}
 
 	/*
 	 * We should have a single rel at the final level.
 	 */
 	if (root->join_rel_level[levels_needed] == NIL)
-	{
 		elog(ERROR, "failed to build any %d-way joins", levels_needed);
-	}
 	Assert(list_length(root->join_rel_level[levels_needed]) == 1);
 
 	rel = (RelOptInfo *) linitial(root->join_rel_level[levels_needed]);
-	result = list_make1(rel);
 
 	root->join_rel_level = NULL;
 
-	return result;
+	return rel;
 }
 
 /*****************************************************************************

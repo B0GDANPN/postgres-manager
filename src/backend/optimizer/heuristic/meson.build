@@ -3,6 +3,6 @@
 backend_sources += files(
   'heuristic_manager.c',
   'graph_utils.c',
-  'goo.c',
+  'heuristics.c',
   'counter.c'
 )

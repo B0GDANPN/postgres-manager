@@ -12,10 +12,7 @@
  *
  *-------------------------------------------------------------------------
  */
-#include <stdbool.h>
-#include "optimizer/heuristic/graph_utils.h"
 #include "postgres.h"
-
 #include "miscadmin.h"
 #include "optimizer/appendinfo.h"
 #include "optimizer/joininfo.h"
@@ -59,7 +56,7 @@ static void get_matching_part_pairs(PlannerInfo *root, RelOptInfo *joinrel, RelO
  *
  * The result is returned in root->join_rel_level[level].
  */
-bool
+void
 join_search_one_level(PlannerInfo *root, int level)
 {
 	List	  **joinrels = root->join_rel_level;
@@ -86,7 +83,6 @@ join_search_one_level(PlannerInfo *root, int level)
 			has_join_restriction(root, old_rel))
 		{
 			int			first_rel;
-			bool		result;
 
 			/*
 			 * There are join clauses or join order restrictions relevant to
@@ -101,27 +97,12 @@ join_search_one_level(PlannerInfo *root, int level)
 			 * to each initial rel they don't already include but have a join
 			 * clause or restriction with.
 			 */
-			if (level == 2)
-			{					/* consider remaining initial rels */
+			if (level == 2)		/* consider remaining initial rels */
 				first_rel = foreach_current_index(r) + 1;
-			}
 			else
-			{
 				first_rel = 0;
-			}
-			/* if (root->spent_budget > root->topology_budget) */
-			/* { */
-			/* return false; */
-			/* } */
-			result = make_rels_by_clause_joins(root,
-											   old_rel,
-											   joinrels[1],
-											   first_rel);
 
-			/* if (!result) */
-			/* { */
-			/* return false; */
-			/* } */
+			make_rels_by_clause_joins(root, old_rel, joinrels[1], first_rel);
 		}
 		else
 		{
@@ -137,20 +118,9 @@ join_search_one_level(PlannerInfo *root, int level)
 			 * such cases aren't common enough to justify adding complexity to
 			 * avoid the duplicated effort.
 			 */
-			bool		result;
-
-			/* if (root->spent_budget > root->topology_budget) */
-			/* { */
-			/* return false; */
-			/* } */
-			result = make_rels_by_clauseless_joins(root,
-												   old_rel,
-												   joinrels[1]);
-
-			/* if (!result) */
-			/* { */
-			/* return false; */
-			/* } */
+			make_rels_by_clauseless_joins(root,
+										  old_rel,
+										  joinrels[1]);
 		}
 	}
 
@@ -171,9 +141,7 @@ join_search_one_level(PlannerInfo *root, int level)
 		 * need to go as far as the halfway point.
 		 */
 		if (k > other_level)
-		{
 			break;
-		}
 
 		foreach(r, joinrels[k])
 		{
@@ -188,18 +156,12 @@ join_search_one_level(PlannerInfo *root, int level)
 			 */
 			if (old_rel->joininfo == NIL && !old_rel->has_eclass_joins &&
 				!has_join_restriction(root, old_rel))
-			{
 				continue;
-			}
 
-			if (k == other_level)
-			{					/* only consider remaining rels */
+			if (k == other_level)	/* only consider remaining rels */
 				first_rel = foreach_current_index(r) + 1;
-			}
 			else
-			{
 				first_rel = 0;
-			}
 
 			for_each_from(r2, joinrels[other_level], first_rel)
 			{
@@ -215,27 +177,7 @@ join_search_one_level(PlannerInfo *root, int level)
 					if (have_relevant_joinclause(root, old_rel, new_rel) ||
 						have_join_order_restriction(root, old_rel, new_rel))
 					{
-						/*
-						 * Cost		tmp = cost_edge(root, old_rel, new_rel);
-						 */
-
-						/*
-						 * if (root->spent_budget + tmp >
-						 * root->topology_budget)
-						 */
-						/* { */
-						/* return false; */
-						/* } */
-
-						/*
-						 * if (root->spent_budget + tmp >
-						 * root->topology_budget)
-						 */
-						/* { */
-						/* return false; */
-						/* } */
 						(void) make_join_rel(root, old_rel, new_rel);
-						/* root->spent_budget += tmp; */
 					}
 				}
 			}
@@ -269,21 +211,11 @@ join_search_one_level(PlannerInfo *root, int level)
 		 */
 		foreach(r, joinrels[level - 1])
 		{
-			bool		result;
 			RelOptInfo *old_rel = (RelOptInfo *) lfirst(r);
 
-			/* if (root->spent_budget > root->topology_budget) */
-			/* { */
-			/* return false; */
-			/* } */
-			result = make_rels_by_clauseless_joins(root,
-												   old_rel,
-												   joinrels[1]);
-
-			/* if (!result) */
-			/* { */
-			/* return false; */
-			/* } */
+			make_rels_by_clauseless_joins(root,
+										  old_rel,
+										  joinrels[1]);
 		}
 
 		/*----------
@@ -304,14 +236,13 @@ join_search_one_level(PlannerInfo *root, int level)
 		 * check is useful.
 		 *----------
 		 */
-		if (joinrels[level] == NIL && root->join_info_list == NIL &&
+		if (joinrels[level] == NIL &&
+			root->join_info_list == NIL &&
 			!root->hasLateralRTEs)
-		{
 			elog(ERROR, "failed to build any %d-way joins", level);
-		}
 	}
-	return true;
 }
+
 
 /*
  * make_rels_by_clause_joins
@@ -347,14 +278,7 @@ make_rels_by_clause_joins(PlannerInfo *root, RelOptInfo *old_rel, List *other_re
 			(have_relevant_joinclause(root, old_rel, other_rel) ||
 			 have_join_order_restriction(root, old_rel, other_rel)))
 		{
-			/* Cost		tmp = cost_edge(root, old_rel, other_rel); */
-
-			/* if (root->spent_budget + tmp > root->topology_budget) */
-			/* { */
-			/* return false; */
-			/* } */
 			(void) make_join_rel(root, old_rel, other_rel);
-			/* root->spent_budget += tmp; */
 		}
 	}
 
@@ -385,14 +309,7 @@ make_rels_by_clauseless_joins(PlannerInfo *root, RelOptInfo *old_rel, List *othe
 
 		if (!bms_overlap(other_rel->relids, old_rel->relids))
 		{
-			/* Cost		tmp = cost_edge(root, old_rel, other_rel); */
-
-			/* if (root->spent_budget + tmp > root->topology_budget) */
-			/* { */
-			/* return false; */
-			/* } */
 			(void) make_join_rel(root, old_rel, other_rel);
-			/* root->spent_budget += tmp; */
 		}
 	}
 	return true;

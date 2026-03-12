@@ -5,7 +5,7 @@ include $(top_builddir)/src/Makefile.global
 OBJS = \
 	counter.o \
 	graph_utils.o \
-	goo.o \
+	heuristics.o \
 	heuristic_manager.o
 
 include $(top_srcdir)/src/backend/common.mk

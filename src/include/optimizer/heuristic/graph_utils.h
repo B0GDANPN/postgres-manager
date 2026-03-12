@@ -1,50 +1,43 @@
 #ifndef GRAPH_UTILS_H
 #define GRAPH_UTILS_H
+#include "c.h"
 #include "postgres.h"
 #include "nodes/nodes.h"
 
 #include "nodes/pathnodes.h"
+static const uint64 csg_threshold = 350;
+static const uint64 CONTRACTION_ROW_LIMIT = 100000;
 typedef struct Vertex
 {
 	RelOptInfo *rel;
 	List	   *adj;
 	size_t		index;
-	int			topology_id;
 }			Vertex;
 
 typedef enum
 {
-	CHAIN, CYCLE, STAR, DENSITY_GRAPH, COMPONENT
+	CHAIN, CYCLE, STAR, DENSITY_GRAPH, COMPONENT,DP,DP_SUB,GOO,ANCHORS
 }			TypeTopology;
 typedef struct Topology
 {
-	int			id;
 	List	   *vertexes;
-	uint64		ccp;
-	Cost		budget;
-	TypeTopology form;
-	Selectivity sel;
-	Cardinality vol;
+	uint64		csg;
 	void	   *extended_info;
+	TypeTopology form;
 }			Topology;
 
 extern int mark_anchor_zones(List *vertexes, bool *used_vertexes);
 extern bool has_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2);
-extern bool is_connected(List *all_vertexes, size_t bitmap);
 extern List *build_join_graph(PlannerInfo *root, List *initial_rels);
 extern List *split_components(PlannerInfo *root, List *vertexes);
-extern List *find_cycles(PlannerInfo *root, List *vertexes, bool *used_vertexes_comp);
-extern List *find_stars(PlannerInfo *root, List *vertexes, bool *used_vertexes);
-extern List *find_chains(PlannerInfo *root, List *vertexes, bool *used_vertexes);
-extern List *find_dense_subgraphs(PlannerInfo *root, List *vertexes, bool *used_vertexes);
 extern void update_indices(Topology * component);
 extern Selectivity get_selectivity(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2);
-extern void set_id(PlannerInfo *root, Topology * topology);
-extern void set_sel_topology(PlannerInfo *root, Topology * topology);
-extern void set_vol_topology(PlannerInfo *root, Topology * topology);
 extern Cost cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2);
 extern RelOptInfo *make_rel(PlannerInfo *root, RelOptInfo *left, RelOptInfo *right);
-extern void print_topology(Topology * topology);
+extern void print_topology(Topology * topology,TypeTopology type);
+extern void print_list(List* rels,TypeTopology type);
 extern void print_trace(RelOptInfo *rel);
 void free_join_graph(List *graph);
+extern Topology *contract_anchors(PlannerInfo *root, Topology *component);
+extern void set_complexity_topology(PlannerInfo *root, Topology * topology);
 #endif

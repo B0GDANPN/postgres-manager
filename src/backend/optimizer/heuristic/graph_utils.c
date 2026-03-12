@@ -1,3 +1,4 @@
+#include "postgres.h"
 #include "optimizer/heuristic/graph_utils.h"
 #include "optimizer/heuristic/counter.h"
 #include "c.h"
@@ -11,7 +12,6 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
-#include "postgres.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/palloc.h"
@@ -22,132 +22,96 @@
 #include <stddef.h>
 #include <string.h>
 
-static const uint64 dphyp_geqo_cc_threshold = 10000;
-static const double THRESH = 0.7;
-static const Selectivity border_selectivity = 0.26;
-static const int max_ray_length = 5;
-static const int min_length_cycle = 3;
-
-/*
- * Anchor zone protection.
- *
- * A vertex is an "anchor" when its estimated rows are tiny relative
- * to its heaviest neighbour (dimension table with a selective filter
- * next to a large fact table).  Separating an anchor from its
- * neighbours during topology decomposition prevents the planner
- * from building index-driven chains that start from the anchor.
- *
- * mark_anchor_zones() sets used_vertexes[i]=true for every anchor
- * and all its immediate neighbours.  The caller must save/restore
- * these bits so that find_chains() later picks them up as one
- * connected component.
- */
-static const double ANCHOR_RATIO   = 100.0;   /* rows < max_nbr / 100 */
-static const double ANCHOR_ABS_MAX = 50000.0;  /* absolute cap          */
-static void set_complexity_topology(PlannerInfo *root, Topology * topology);
+static const double ANCHOR_RATIO = 100.0;	/* rows < max_nbr / 100 */
+static const double ANCHOR_ABS_MAX = 50000.0;	/* absolute cap          */
 static List *bfs_component(Vertex * start, bool *used_vertexes);
-static bool dfs_cycle(PlannerInfo *root, Vertex * prev, Vertex * cur,
-					  List **stack, bool *visited,
-					  bool *used_vertexes_comp);	/* stack is list of Vertex*  */
-static bool is_star(Vertex * center, const bool *used_vertexes);
-static List *find_star(PlannerInfo *root, Vertex * center, bool *used_vertexes,
-					   List **chains);
-static Vertex * find_min_degree_vertex_cached(Selectivity *sel_cache, int nv, List *sub);
-static double density_cached(Selectivity *sel_cache, int nv, List *sub);
-static int	count_edges_cached(Selectivity *sel_cache, int nv, List *sub);
-static List *peel_dense(Selectivity *sel_cache, int nv, List *candidate);
-
-
 
 /**
- * @brief Mark anchor zones with 2-hop protection.
+ * @brief Mark anchor zones (anchor + 1-hop + 2-hop neighbours).
  *
- * An anchor is a vertex whose filtered rows are tiny relative to its
- * heaviest neighbour.  We protect the anchor, its immediate neighbours
- * (1-hop) and their neighbours (2-hop).  This ensures that topology
- * detectors (dense, star, cycle) cannot separate the selective anchor
- * from the join paths that exploit its selectivity.
+ * An anchor is a vertex with rows < ANCHOR_ABS_MAX whose rows are
+ * at least ANCHOR_RATIO times smaller than its heaviest neighbour.
+ * Sets used_vertexes[i]=true for all vertices in anchor zones.
  *
- * 2-hop is necessary because star/cycle detectors operate on the
- * UNMARKED subgraph.  With only 1-hop protection, the anchor's
- * neighbour-of-neighbour can become a star center and pull away
- * tables that should be planned together with the anchor.
+ * @param vertexes      List of Vertex* forming the join graph.
+ * @param used_vertexes Boolean array indexed by vertex->index (modified).
+ * @return Number of newly marked vertices.
  */
 int
 mark_anchor_zones(List *vertexes, bool *used_vertexes)
 {
-    int         marked = 0;
-    ListCell   *lc;
-    List       *hop1_vertices = NIL;  /* 1-hop neighbours to expand */
+	int			marked = 0;
+	ListCell   *lc;
+	List	   *hop1_vertices = NIL;	/* 1-hop neighbours to expand */
 
-    /* Pass 1: find anchors, mark them + their immediate neighbours */
-    foreach(lc, vertexes)
-    {
-        Vertex     *v = (Vertex *) lfirst(lc);
-        Cardinality max_nbr_rows = 0;
-        int         unused_nbrs = 0;
-        ListCell   *lc2;
+	/* Pass 1: find anchors, mark them + their immediate neighbours */
+	foreach(lc, vertexes)
+	{
+		Vertex	   *v = (Vertex *) lfirst(lc);
+		Cardinality max_nbr_rows = 0;
+		int			unused_nbrs = 0;
+		ListCell   *lc2;
 
-        if (used_vertexes[v->index])
-            continue;
+		if (used_vertexes[v->index])
+			continue;
 
-        foreach(lc2, v->adj)
-        {
-            Vertex *nbr = (Vertex *) lfirst(lc2);
-            if (!used_vertexes[nbr->index])
-            {
-                unused_nbrs++;
-                if (nbr->rel->rows > max_nbr_rows)
-                    max_nbr_rows = nbr->rel->rows;
-            }
-        }
+		foreach(lc2, v->adj)
+		{
+			Vertex	   *nbr = (Vertex *) lfirst(lc2);
 
-        if (unused_nbrs == 0)
-            continue;
+			if (!used_vertexes[nbr->index])
+			{
+				unused_nbrs++;
+				if (nbr->rel->rows > max_nbr_rows)
+					max_nbr_rows = nbr->rel->rows;
+			}
+		}
 
-        if (v->rel->rows < ANCHOR_ABS_MAX &&
-            v->rel->rows * ANCHOR_RATIO < max_nbr_rows)
-        {
-            /* Mark anchor itself */
-            if (!used_vertexes[v->index])
-            {
-                used_vertexes[v->index] = true;
-                marked++;
-            }
+		if (unused_nbrs == 0)
+			continue;
 
-            /* Mark 1-hop neighbours and collect them for 2-hop */
-            foreach(lc2, v->adj)
-            {
-                Vertex *nbr = (Vertex *) lfirst(lc2);
-                if (!used_vertexes[nbr->index])
-                {
-                    used_vertexes[nbr->index] = true;
-                    marked++;
-                    hop1_vertices = lappend(hop1_vertices, nbr);
-                }
-            }
-        }
-    }
+		if (v->rel->rows < ANCHOR_ABS_MAX &&
+			v->rel->rows * ANCHOR_RATIO < max_nbr_rows)
+		{
+			if (!used_vertexes[v->index])
+			{
+				used_vertexes[v->index] = true;
+				marked++;
+			}
 
-    /* Pass 2: mark 2-hop (neighbours of 1-hop vertices) */
-    foreach(lc, hop1_vertices)
-    {
-        Vertex     *v = (Vertex *) lfirst(lc);
-        ListCell   *lc2;
+			foreach(lc2, v->adj)
+			{
+				Vertex	   *nbr = (Vertex *) lfirst(lc2);
 
-        foreach(lc2, v->adj)
-        {
-            Vertex *nbr = (Vertex *) lfirst(lc2);
-            if (!used_vertexes[nbr->index])
-            {
-                used_vertexes[nbr->index] = true;
-                marked++;
-            }
-        }
-    }
+				if (!used_vertexes[nbr->index])
+				{
+					used_vertexes[nbr->index] = true;
+					marked++;
+					hop1_vertices = lappend(hop1_vertices, nbr);
+				}
+			}
+		}
+	}
 
-    list_free(hop1_vertices);
-    return marked;
+	foreach(lc, hop1_vertices)
+	{
+		Vertex	   *v = (Vertex *) lfirst(lc);
+		ListCell   *lc2;
+
+		foreach(lc2, v->adj)
+		{
+			Vertex	   *nbr = (Vertex *) lfirst(lc2);
+
+			if (!used_vertexes[nbr->index])
+			{
+				used_vertexes[nbr->index] = true;
+				marked++;
+			}
+		}
+	}
+
+	list_free(hop1_vertices);
+	return marked;
 }
 
 /**
@@ -170,14 +134,6 @@ has_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 	return result;
 }
 
-/**
- * @brief Emit a debug representation of the join graph.
- *
- * Logs each vertex, its cost, and adjacent edge costs.
- *
- * @param root Planner context.
- * @param graph List of Vertex items.
- */
 static void
 print_graph(PlannerInfo *root, List *graph)
 {
@@ -220,25 +176,16 @@ print_graph(PlannerInfo *root, List *graph)
 	pfree(buf.data);
 }
 
-/**
- * @brief Debug print a topology.
- *
- * Prints the type of the topology, selectivity, count connected pairs of
- * subgraphs, volume, and budget. If the topology is a star, prints the center
- * and chains of the star (each chain on a new line).
- *
- * Also prints Bitmapset of each vertex in the topology.
- * @param topology Topology to print.
- */
+
 void
-print_topology(Topology * topology)
+print_topology(Topology * topology, TypeTopology type)
 {
 	StringInfoData buf;
 	ListCell   *lc = NULL;
 
 	initStringInfo(&buf);
 	appendStringInfo(&buf, "\n----------------------PRINT_TOPOLOGY\n");
-	switch (topology->form)
+	switch (type)
 	{
 		case CHAIN:
 			{
@@ -265,14 +212,30 @@ print_topology(Topology * topology)
 				appendStringInfo(&buf, "Component\n");
 				break;
 			}
+		case GOO:
+			{
+				appendStringInfo(&buf, "GOO\n");
+				break;
+			}
+		case DP:
+			{
+				appendStringInfo(&buf, "DP\n");
+				break;
+			}
+		case DP_SUB:
+			{
+				appendStringInfo(&buf, "DP_SUB\n");
+				break;
+			}
+		case ANCHORS:
+			{
+				appendStringInfo(&buf, "ANCHORS\n");
+				break;
+			}
 	}
-	appendStringInfo(&buf, "sel: %.10lf\n", topology->sel);
-	appendStringInfo(&buf, "ccp: %lu\n", topology->ccp);
-	appendStringInfo(&buf, "vol: %lf\n", topology->vol);
-	appendStringInfo(&buf, "budget: %lf\n", topology->budget);
 	appendStringInfo(&buf, "vertexes: ");
 
-	if (topology->form == STAR)
+	if (type == STAR)
 	{
 		Vertex	   *center = (Vertex *) linitial(topology->vertexes);
 		ListCell   *lc = NULL;
@@ -323,14 +286,14 @@ print_topology(Topology * topology)
 }
 
 /**
- * @brief Build a join graph from initial relations.
+ * @brief Build a join graph from a list of relations.
  *
- * Creates a vertex per relation and adds edges for simple inner joins.
+ * Allocates a Vertex per RelOptInfo, discovers edges via has_edge(),
+ * and emits a debug print. Caller owns the returned Vertex list.
  *
- * @param root Planner context.
- * @param initial_rels Base relations to include.
- *
- * @return List of Vertex items representing the join graph.
+ * @param root         PlannerInfo context.
+ * @param initial_rels List of RelOptInfo* (base or composite).
+ * @return List of Vertex* with populated adjacency lists.
  */
 List *
 build_join_graph(PlannerInfo *root, List *initial_rels)
@@ -366,7 +329,7 @@ build_join_graph(PlannerInfo *root, List *initial_rels)
 			}
 		}
 	}
-	print_graph(root, vertexes);
+	/* print_graph(root, vertexes); */
 	return vertexes;
 }
 
@@ -408,15 +371,16 @@ bfs_component(Vertex * start, bool *used_vertexes)
 	return queue;
 }
 
+
 /**
  * @brief Split a join graph into connected components.
  *
- * Builds Topology objects and computes selectivity, volume, and complexity.
+ * BFS from each unvisited vertex. Each component becomes a Topology
+ * with form=COMPONENT and csg computed via set_complexity_topology.
  *
- * @param root Planner context.
- * @param vertexes Join graph vertices.
- *
- * @return List of Topology components.
+ * @param root     PlannerInfo context.
+ * @param vertexes List of Vertex* (the full join graph).
+ * @return List of Topology* (one per connected component).
  */
 List *
 split_components(PlannerInfo *root, List *vertexes)
@@ -437,10 +401,6 @@ split_components(PlannerInfo *root, List *vertexes)
 
 			component->vertexes = sub;
 			component->form = COMPONENT;
-			/*set_id(root, component);
-			set_sel_topology(root, component);
-			set_vol_topology(root, component);
-			set_complexity_topology(root, component);*/
 			comps = lappend(comps, component);
 		}
 	}
@@ -448,377 +408,14 @@ split_components(PlannerInfo *root, List *vertexes)
 	return comps;
 }
 
-/* find cycle */
-static bool
-dfs_cycle(PlannerInfo *root, Vertex * prev, Vertex * cur,
-		  List **stack, bool *visited, bool *used_vertexes_comp)
-{
-	ListCell   *lc = NULL;
-
-	visited[cur->index] = true;
-	*stack = lappend(*stack, cur);
-	foreach(lc, cur->adj)
-	{
-		Vertex	   *nbr = (Vertex *) lfirst(lc);
-		Selectivity sel;
-
-		if (nbr == prev)
-		{
-			continue;
-		}
-		sel = get_selectivity(root, cur->rel, nbr->rel);
-		if (sel > border_selectivity)
-		{
-			continue;
-		}
-		if (visited[nbr->index] && (*stack)->length >= min_length_cycle)
-		{
-			List	   *cycle = NIL;
-			ListCell   *lc2 = NULL;
-			ListCell   *lc3 = NULL;
-
-			foreach(lc2, *stack)
-			{
-				Vertex	   *it = (Vertex *) lfirst(lc2);
-
-				if (it->index == nbr->index)
-				{
-					break;
-				}
-			}
-			for_each_cell(lc3, *stack, lc2)
-			{
-				Vertex	   *it = (Vertex *) lfirst(lc3);
-
-				cycle = lappend(cycle, it);
-				used_vertexes_comp[it->index] = true;
-			}
-			list_free(*stack);
-			*stack = cycle;
-			return true;
-		}
-		if (!visited[nbr->index] && !used_vertexes_comp[nbr->index])
-		{
-			bool		was_cycle =
-				dfs_cycle(root, cur, nbr, stack, visited, used_vertexes_comp);
-
-			if (was_cycle)
-			{
-				return true;
-			}
-		}
-	}
-	visited[cur->index] = false;
-	*stack = list_delete_last(*stack);
-	return false;
-}
 
 /**
- * @brief Check whether a -selected subgraph is connected.
+ * @brief Reassign sequential indices 0..n-1 to topology vertices.
  *
- * Builds the vertex subset from the bitmap and verifies connectivity with BFS.
+ * Must be called after any vertex list modification (contraction,
+ * rebuild) before algorithms that index by vertex->index.
  *
- * @param all_vertexes All vertices in the topology.
- * @param bitmap Bitmask selecting a subset of vertices.
- *
- * @return True if the selected subgraph is connected.
- */
-bool
-is_connected(List *all_vertexes, size_t bitmap)
-{
-	List	   *vertices = NIL;
-	bool	   *used = NULL;
-	Vertex	   *start = NULL;
-	size_t		topology_id;
-	List	   *queue = NIL;
-	int			begin_queue = 0;
-	ListCell   *lc = NULL;
-	bool		connected = true;
-
-	for (uint64 i = 0; ((uint64) 1 << i) <= bitmap; i++)
-	{
-		if (bitmap & ((uint64) 1 << i))
-		{
-			Vertex	   *v = (Vertex *) list_nth(all_vertexes, i);
-
-			vertices = lappend(vertices, v);
-		}
-	}
-	/* check that vertexes are connected */
-	used = (bool *) palloc0(list_length(all_vertexes) * sizeof(bool));
-	start = (Vertex *) linitial(vertices);
-	topology_id = start->topology_id;
-	queue = list_make1(start);
-	used[start->index] = true;
-	while (begin_queue < list_length(queue))
-	{
-		Vertex	   *v = (Vertex *) lfirst(list_nth_cell(queue, begin_queue));
-
-		begin_queue++;
-		foreach(lc, v->adj)
-		{
-			Vertex	   *next = (Vertex *) lfirst(lc);
-
-			if (!used[next->index] && next->topology_id == topology_id)
-			{
-				used[next->index] = true;
-				queue = lappend(queue, next);
-			}
-		}
-	}
-	list_free(queue);
-	foreach(lc, vertices)
-	{
-		Vertex	   *v = (Vertex *) lfirst(lc);
-
-		if (!used[v->index])
-		{
-			connected = false;
-			break;
-		}
-	}
-	list_free(vertices);
-	pfree(used);
-	return connected;
-}
-
-/* find non intersecting cycles */
-List *
-find_cycles(PlannerInfo *root, List *vertexes, bool *used_vertexes_comp)
-{
-	int			n_local = list_length(vertexes);
-	List	   *cycles = NIL;	/* List* of List* of Vertex*  */
-	bool	   *visited = (bool *) palloc0(n_local * sizeof(bool));
-	ListCell   *lc = NULL;
-	List	   *cyclic_topologies = NIL;
-
-	foreach(lc, vertexes)
-	{
-		Vertex	   *v = (Vertex *) lfirst(lc);
-		List	   *stack = NIL;
-
-		if (used_vertexes_comp[v->index])
-		{
-			continue;
-		}
-		memset(visited, false, n_local * sizeof(bool));
-		dfs_cycle(root, NULL, v, &stack, visited, used_vertexes_comp);
-		if (stack)
-		{
-			cycles = lappend(cycles, stack);
-		}
-	}
-	foreach(lc, cycles)
-	{
-		List	   *cycle = (List *) lfirst(lc);
-		Topology   *topology = (Topology *) palloc0(sizeof(Topology));
-
-		topology->vertexes = cycle;
-		topology->form = CYCLE;
-		/*set_id(root, topology);
-		set_sel_topology(root, topology);
-		set_vol_topology(root, topology);
-		set_complexity_topology(root, topology);*/
-		cyclic_topologies = lappend(cyclic_topologies, topology);
-		/* print_topology(topology); */
-	}
-	pfree(visited);
-	return cyclic_topologies;
-}
-
-/**
- * @brief Decide whether a vertex can be treated as a star center.
- *
- * Checks degree and relative volume of neighbors.
- *
- * @param center Candidate center vertex.
- * @param used_vertexes Used marker array.
- *
- * @return True if the vertex qualifies as a star center.
- */
-static bool
-is_star(Vertex *center, const bool *used_vertexes)
-{
-    double center_rows = center->rel->rows;
-    int count_unused = 0;
-    double sum_neighbor_rows = 0;
-	ListCell   *lc = NULL;
-    foreach(lc, center->adj) {
-        Vertex *nbr = lfirst(lc);
-        if (!used_vertexes[nbr->index]) {
-            count_unused++;
-            sum_neighbor_rows += nbr->rel->rows;
-        }
-    }
-    
-    if (count_unused < 3)
-        return false;
-    
-    if (center_rows > sum_neighbor_rows / count_unused)
-        return false;
-    
-    return true;
-}
-
-/**
- * @brief Build a star topology around a center vertex.
- *
- * Grows rays up to a maximum length by selectivity.
- *
- * @param root Planner context.
- * @param center Star center vertex.
- * @param used_vertexes Used marker array.
- * @param chains Output list of ray chains.
- *
- * @return List of vertices that form the star.
- */
-static List *
-find_star(PlannerInfo *root, Vertex * center, bool *used_vertexes,
-		  List **chains)
-{
-	List	   *star = NIL;
-	ListCell   *lc = NULL;
-
-	star = lappend(star, center);
-	used_vertexes[center->index] = true;
-	foreach(lc, center->adj)
-	{
-		int			ray_len = 0;
-		Vertex	   *curr = (Vertex *) lfirst(lc);
-		List	   *chain = NIL;
-
-		if (used_vertexes[curr->index])
-		{
-			continue;
-		}
-		while (ray_len < max_ray_length)
-		{
-			Selectivity sel;
-			Vertex	   *new_neighbor = NULL;
-			ListCell   *lc2 = NULL;
-
-			chain = lappend(chain, curr);
-			used_vertexes[curr->index] = true;
-			ray_len += 1;
-			sel = border_selectivity;
-			foreach(lc2, curr->adj)
-			{
-				Selectivity tmp_sel;
-				Vertex	   *tmp = (Vertex *) lfirst(lc2);
-
-				if (used_vertexes[tmp->index] || is_star(tmp, used_vertexes))
-				{
-					continue;
-				}
-				tmp_sel = get_selectivity(root, curr->rel, tmp->rel);
-				if (tmp_sel < sel)
-				{
-					new_neighbor = tmp;
-					sel = tmp_sel;
-				}
-			}
-			if (new_neighbor == NULL)
-			{
-				break;
-			}
-			curr = new_neighbor;
-		}
-		star = list_concat(star, chain);
-		*chains = lappend(*chains, chain);
-	}
-	return star;
-}
-
-/**
- * @brief Find star topologies among unused vertices.
- *
- * Detects star centers and builds star topologies with ray chains.
- *
- * @param root Planner context.
- * @param vertexes Join graph vertices.
- * @param used_vertexes Used marker array.
- *
- * @return List of STAR topologies.
- */
-List *
-find_stars(PlannerInfo *root, List *vertexes, bool *used_vertexes)
-{
-	List	   *stars = NIL;
-	ListCell   *lc = NULL;
-
-	foreach(lc, vertexes)
-	{
-		Topology   *topology = NULL;
-		Vertex	   *v = (Vertex *) lfirst(lc);
-		List	   *chains = NIL;
-		List	   *star = NIL;
-
-		if (used_vertexes[v->index] || !is_star(v, used_vertexes))
-		{
-			continue;
-		}
-		star = find_star(root, v, used_vertexes,
-						 &chains);	/* List* of {star_vertex, List1 of chain
-									 * vertex, List_n of chain vertex} */
-		topology = (Topology *) palloc0(sizeof(Topology));
-		topology->vertexes = star;
-		topology->form = STAR;
-		topology->extended_info = chains;
-		/*set_id(root, topology);
-		set_sel_topology(root, topology);
-		set_vol_topology(root, topology);
-		set_complexity_topology(root, topology);*/
-		stars = lappend(stars, topology);
-		/* print_topology(topology); */
-	}
-	return stars;
-}
-
-/**
- * @brief Count "good" internal edges in a vertex subset using cached selectivities.
- *
- * An edge is counted only when its cached selectivity does not
- * exceed border_selectivity.
- *
- * @param sel_cache  Flat nv*nv selectivity matrix; -1.0 = no edge.
- * @param nv         Dimension of the cache (total vertices in component).
- * @param sub        Vertex subset.
- *
- * @return Number of good internal edges.
- */
-static int
-count_edges_cached(Selectivity *sel_cache, int nv, List *sub)
-{
-	int			m = 0;
-	ListCell   *lc = NULL;
-
-	foreach(lc, sub)
-	{
-		Vertex	   *v1 = (Vertex *) lfirst(lc);
-		ListCell   *lc2 = NULL;
-
-		foreach(lc2, v1->adj)
-		{
-			Vertex	   *v2 = (Vertex *) lfirst(lc2);
-
-			if (v1->index < v2->index && list_member_ptr(sub, v2))
-			{
-				Selectivity sel = sel_cache[v1->index * nv + v2->index];
-
-				if (sel >= 0 && sel <= border_selectivity)
-				{
-					m++;
-				}
-			}
-		}
-	}
-	return m;
-}
-
-/**
- * @brief Reassign indices for topology vertices.
- *
- * @param component Topology to update.
+ * @param component Topology whose vertexes to re-index.
  */
 void
 update_indices(Topology * component)
@@ -836,305 +433,16 @@ update_indices(Topology * component)
 }
 
 /**
- * @brief Compute edge density for a vertex subset using cached selectivities.
- *
- * @param sel_cache  Flat nv*nv selectivity matrix.
- * @param nv         Cache dimension.
- * @param sub        Vertex subset.
- *
- * @return Density in [0,1], or 0 for small sets.
+ * @brief Compute connected subgraph count (csg) for a topology.
+ * @param root     PlannerInfo context.
+ * @param topology Topology to update (csg field written).
  */
-static double
-density_cached(Selectivity *sel_cache, int nv, List *sub)
-{
-	int			n = list_length(sub);
-	int			m;
-	double		d;
-
-	if (n < 4)
-		return 0.0;
-
-	m = count_edges_cached(sel_cache, nv, sub);
-	d = (double) m / ((double) n * (n - 1) / 2.0);
-	return d;
-}
-
-/**
- * @brief Find the vertex with minimum "good" degree using cached selectivities.
- *
- * Only edges with cached selectivity <= border_selectivity are counted
- * toward a vertex's degree, consistent with the density metric.
- *
- * @param sel_cache  Flat nv*nv selectivity matrix.
- * @param nv         Cache dimension.
- * @param sub        Vertex subset.
- *
- * @return Vertex with the lowest good-edge degree.
- */
-static Vertex *
-find_min_degree_vertex_cached(Selectivity *sel_cache, int nv, List *sub)
-{
-	int			best_deg = INT_MAX;
-	Vertex	   *best_v = NULL;
-	ListCell   *lc = NULL;
-
-	foreach(lc, sub)
-	{
-		Vertex	   *v = (Vertex *) lfirst(lc);
-		int			deg = 0;
-		ListCell   *lc2 = NULL;
-
-		foreach(lc2, v->adj)
-		{
-			Vertex	   *nbr = (Vertex *) lfirst(lc2);
-
-			if (list_member_ptr(sub, nbr))
-			{
-				Selectivity sel = sel_cache[v->index * nv + nbr->index];
-
-				if (sel >= 0 && sel <= border_selectivity)
-				{
-					deg++;
-				}
-			}
-		}
-
-		if (deg < best_deg)
-		{
-			best_deg = deg;
-			best_v = v;
-		}
-	}
-	return best_v;
-}
-
-/**
- * @brief Attempt to peel a candidate vertex set down to a dense core.
- *
- * Iteratively removes the vertex with the lowest good-edge degree until
- * the remaining subgraph has density >= THRESH, or the candidate becomes
- * too small.
- *
- * @param sel_cache  Flat nv*nv selectivity matrix.
- * @param nv         Cache dimension.
- * @param candidate  List of Vertex* to peel (consumed — caller loses ownership).
- *
- * @return The peeled dense core (List of Vertex*), or NIL if peeling failed.
- *         On failure the candidate list is freed.
- */
-static List *
-peel_dense(Selectivity *sel_cache, int nv, List *candidate)
-{
-	while (list_length(candidate) >= 4)
-	{
-		Vertex	   *vmin = NULL;
-		double		cur_d = density_cached(sel_cache, nv, candidate);
-
-		if (cur_d >= THRESH)
-			return candidate;
-
-		vmin = find_min_degree_vertex_cached(sel_cache, nv, candidate);
-		if (vmin == NULL)
-			break;
-
-		candidate = list_delete_ptr(candidate, vmin);
-	}
-
-	/* Check once more after the loop exits (size may be exactly 4) */
-	if (list_length(candidate) >= 4 &&
-		density_cached(sel_cache, nv, candidate) >= THRESH)
-	{
-		return candidate;
-	}
-
-	list_free(candidate);
-	return NIL;
-}
-
-/**
- * @brief Find dense subgraphs and return them as topologies.
- *
- * Builds a selectivity cache once for the entire component,
- * then on each iteration splits unused vertices into connected
- * components using only good edges (sel <= border_selectivity)
- * and tries to peel each component independently.
- *
- * This avoids the bug where a single failed peeling of the full
- * unused vertex set prevents discovery of dense subgraphs that
- * exist in independent sub-components of the graph.
- *
- * @param root     Planner context.
- * @param vertexes Join graph vertices (indices must be 0..nv-1).
- * @param used     Used marker array (size >= nv, updated in-place).
- *
- * @return List of DENSITY_GRAPH topologies.
- */
-List *
-find_dense_subgraphs(PlannerInfo *root, List *vertexes, bool *used)
-{
-	List	   *dense_sets = NIL;
-	int			nv = list_length(vertexes);
-	Selectivity *sel_cache;
-	ListCell   *lc;
-
-	/*
-	 * Build selectivity cache — one get_selectivity() call per edge,
-	 * instead of n * edges calls during repeated density/peeling passes. -1.0
-	 * = no adjacency between these vertices.
-	 */
-	sel_cache = (Selectivity *) palloc(nv * nv * sizeof(Selectivity));
-	for (int i = 0; i < nv * nv; i++)
-		sel_cache[i] = -1.0;
-
-	foreach(lc, vertexes)
-	{
-		Vertex	   *v1 = (Vertex *) lfirst(lc);
-		ListCell   *lc2;
-
-		foreach(lc2, v1->adj)
-		{
-			Vertex	   *v2 = (Vertex *) lfirst(lc2);
-
-			if (v1->index < v2->index)
-			{
-				Selectivity s = get_selectivity(root, v1->rel, v2->rel);
-
-				sel_cache[v1->index * nv + v2->index] = s;
-				sel_cache[v2->index * nv + v1->index] = s;
-			}
-		}
-	}
-
-	/*
-	 * Main loop: on each iteration, collect unused vertices, split them into
-	 * connected components (good-edge-only), and try peeling each. Re-enter
-	 * only if at least one dense subgraph was found (remaining fragments of a
-	 * large component may form new dense cores).
-	 */
-	while (true)
-	{
-		List	   *all_unused = NIL;
-		bool	   *comp_visited;
-		bool		found_any = false;
-
-		foreach(lc, vertexes)
-		{
-			Vertex	   *v = (Vertex *) lfirst(lc);
-
-			if (!used[v->index])
-				all_unused = lappend(all_unused, v);
-		}
-
-		if (list_length(all_unused) < 4)
-		{
-			list_free(all_unused);
-			break;
-		}
-
-		/*
-		 * Split unused vertices into connected components, following only
-		 * "good" edges (sel <= border_selectivity).  This ensures that two
-		 * clusters connected only by near-Cartesian joins are treated
-		 * independently.
-		 */
-		comp_visited = (bool *) palloc0(nv * sizeof(bool));
-		for (int i = 0; i < nv; i++)
-			comp_visited[i] = used[i];
-
-		foreach(lc, all_unused)
-		{
-			Vertex	   *start = (Vertex *) lfirst(lc);
-			List	   *component;
-			List	   *dense_core;
-			int			begin_q;
-			ListCell   *lc2;
-
-			if (comp_visited[start->index])
-				continue;
-
-			/* BFS: follow only edges with selectivity <= border_selectivity */
-			comp_visited[start->index] = true;
-			component = list_make1(start);
-			begin_q = 0;
-
-			while (begin_q < list_length(component))
-			{
-				Vertex	   *v = (Vertex *) lfirst(list_nth_cell(component, begin_q));
-
-				begin_q++;
-				foreach(lc2, v->adj)
-				{
-					Vertex	   *nbr = (Vertex *) lfirst(lc2);
-					Selectivity s;
-
-					if (comp_visited[nbr->index])
-						continue;
-
-					s = sel_cache[v->index * nv + nbr->index];
-					if (s >= 0 && s <= border_selectivity)
-					{
-						comp_visited[nbr->index] = true;
-						component = lappend(component, nbr);
-					}
-				}
-			}
-
-			if (list_length(component) < 4)
-			{
-				list_free(component);
-				continue;
-			}
-
-			/* Try peeling this connected component to a dense core. */
-			dense_core = peel_dense(sel_cache, nv, list_copy(component));
-			list_free(component);
-
-			if (dense_core != NIL)
-			{
-				Topology   *topology = (Topology *) palloc0(sizeof(Topology));
-
-				topology->vertexes = dense_core;
-				topology->form = DENSITY_GRAPH;
-				/*set_id(root, topology);
-				set_sel_topology(root, topology);
-				set_vol_topology(root, topology);
-				set_complexity_topology(root, topology);*/
-				dense_sets = lappend(dense_sets, topology);
-
-				foreach(lc2, dense_core)
-				{
-					Vertex	   *v = (Vertex *) lfirst(lc2);
-
-					used[v->index] = true;
-				}
-				found_any = true;
-			}
-		}
-
-		pfree(comp_visited);
-		list_free(all_unused);
-
-		if (!found_any)
-			break;
-	}
-
-	pfree(sel_cache);
-	return dense_sets;
-}
-
-/**
- * @brief Estimate topology complexity via connected subgraph counting.
- *
- * @param root Planner context.
- * @param topology Topology to update.
- */
-static void
+void
 set_complexity_topology(PlannerInfo *root, Topology * topology)
 {
 	DPHypContext context = {0};
 	List	   *initial_rels = NIL;
 	ListCell   *lc = NULL;
-	uint64		subgraphs_count;
 
 	foreach(lc, topology->vertexes)
 	{
@@ -1148,8 +456,7 @@ set_complexity_topology(PlannerInfo *root, Topology * topology)
 
 	initialize_edges(root, initial_rels, &context);
 
-	subgraphs_count = count_cc(&context, dphyp_geqo_cc_threshold);
-	topology->ccp = subgraphs_count;
+	topology->csg = count_cc(&context, 10000);
 	list_free(context.initial_rels);
 	list_free(context.simple_hypernodes);
 	pfree(context.simple_edges);
@@ -1158,15 +465,15 @@ set_complexity_topology(PlannerInfo *root, Topology * topology)
 }
 
 /**
- * @brief Compute join selectivity for a relation pair.
+ * @brief Estimate join selectivity between two relations.
  *
- * Builds a dummy join rel and evaluates clause selectivity.
+ * Constructs a dummy join context and evaluates clause selectivity
+ * using PostgreSQL's clauselist_selectivity.
  *
- * @param root Planner context.
+ * @param root PlannerInfo context.
  * @param rel1 First relation.
  * @param rel2 Second relation.
- *
- * @return Estimated selectivity for joining rel1 and rel2.
+ * @return Estimated selectivity in [0, 1].
  */
 Selectivity
 get_selectivity(PlannerInfo *root, RelOptInfo *rel1,
@@ -1219,88 +526,19 @@ get_selectivity(PlannerInfo *root, RelOptInfo *rel1,
 	return result;
 }
 
-/**
- * @brief Compute topology volume as product of row counts.
- *
- * @param root Planner context.
- * @param topology Topology to update.
- */
-void
-set_vol_topology(PlannerInfo *root, Topology * topology)
-{
-	Cardinality vol = 1;
-	List	   *vertexes = topology->vertexes;
-	ListCell   *i = NULL;
 
-	foreach(i, vertexes)
-	{
-		RelOptInfo *rel = ((Vertex *) lfirst(i))->rel;
-
-		vol *= rel->rows;
-	}
-	topology->vol = vol;
-}
-
-void
-set_id(PlannerInfo *root, Topology * topology)
-{
-	ListCell   *lc = NULL;
-
-	topology->id = root->last_topology_id++;
-	foreach(lc, topology->vertexes)
-	{
-		Vertex	   *v = (Vertex *) lfirst(lc);
-
-		v->topology_id = topology->id;
-	}
-}
 
 /**
- * @brief Compute topology selectivity from join clauses.
+ * @brief Estimate minimum join cost between two relations.
  *
- * Aggregates join clauses fully contained in the topology and applies
- * selectivity estimation.
+ * Tries both (rel1,rel2) and (rel2,rel1) orderings with NestLoop,
+ * HashJoin, and MergeJoin initial_cost functions. Returns the
+ * minimum across all combinations. Does NOT call make_join_rel.
  *
- * @param root Planner context.
- * @param topology Topology to update.
- */
-void
-set_sel_topology(PlannerInfo *root, Topology * topology)
-{
-	Selectivity sel = 1.0;
-	List	   *vertexes = topology->vertexes;
-	ListCell   *lc;
-
-	foreach(lc, vertexes)
-	{
-		Vertex	   *v = (Vertex *) lfirst(lc);
-		ListCell   *lc2;
-
-		foreach(lc2, v->adj)
-		{
-			Vertex	   *nbr = (Vertex *) lfirst(lc2);
-
-			if (v->index < nbr->index &&
-				nbr->topology_id == v->topology_id)
-			{
-				sel *= get_selectivity(root, v->rel, nbr->rel);
-			}
-		}
-	}
-
-	topology->sel = sel;
-}
-
-/**
- * @brief Estimate the cheapest join cost between two relations.
- *
- * Considers nestloop, hashjoin, and mergejoin initial costs.
- *
- * @param root Planner context.
+ * @param root PlannerInfo context.
  * @param rel1 First relation.
  * @param rel2 Second relation.
- *
- * @return Minimum estimated join cost.
+ * @return Minimum estimated join cost (DBL_MAX if no join possible).
  */
 Cost
 cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
@@ -1387,8 +625,8 @@ cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 		/* ---- Mergejoin ---- */
 
 		/*
-		 * Pre-filter: only clauses with mergeopfamilies can participate
-		 * in a merge join.  find_mergeclauses_for_outer_pathkeys() calls
+		 * Pre-filter: only clauses with mergeopfamilies can participate in a
+		 * merge join.  find_mergeclauses_for_outer_pathkeys() calls
 		 * update_mergeclause_eclasses() which asserts mergeopfamilies != NIL,
 		 * so passing unfiltered restrictlist causes an assertion failure.
 		 */
@@ -1403,8 +641,8 @@ cost_edge(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 		if (merge_candidates != NIL)
 		{
 			mergeclauses = find_mergeclauses_for_outer_pathkeys(
-															   root, outer_path->pathkeys,
-															   merge_candidates);
+																root, outer_path->pathkeys,
+																merge_candidates);
 		}
 
 		if (mergeclauses != NIL)
@@ -1502,106 +740,181 @@ make_rel(PlannerInfo *root, RelOptInfo *left, RelOptInfo *right)
 }
 
 /**
- * @brief Check whether a list of vertices forms a true path graph.
+ * @brief Contract anchor zones into pre-planned virtual vertices.
  *
- * A path graph on n vertices has exactly n-1 edges (among vertices
- * in the list) and every vertex has internal degree <= 2.
- * Triangles or shortcut edges disqualify it.
+ * Identifies anchors (small rows relative to neighbours), groups them
+ * with 1-hop neighbours into zones, plans each zone via
+ * standard_join_search, and rebuilds the join graph with virtual
+ * vertices replacing zones. Zones whose plan exceeds
+ * CONTRACTION_ROW_LIMIT rows are left uncontracted.
  *
- * @param vertexes  List of Vertex* forming the subgraph.
- * @return true if the subgraph is a genuine path (chain).
+ * @param root      PlannerInfo context.
+ * @param component Topology with form=COMPONENT (vertexes consumed
+ *                  on success, unchanged on no-op).
+ * @return Same Topology pointer with (possibly) fewer vertices.
  */
-static bool
-is_path_graph(List *vertexes)
+Topology *
+contract_anchors(PlannerInfo *root, Topology * component)
 {
-    int     n = list_length(vertexes);
-    int     edge_count = 0;
-    bool   *in_sub = NULL;
-    int     max_idx = 0;
-    ListCell *lc;
+	int			nv = list_length(component->vertexes);
+	bool	   *in_zone;
+	bool	   *visited;
+	List	   *all_rels = NIL;
+	ListCell   *lc;
+	int			zone_count = 0;
+	int			marked = 0;
 
-    if (n <= 2)
-        return true;    /* trivially a path */
+	if (nv <= 2)
+		return component;
 
-    /* Find max index for the membership array */
-    foreach(lc, vertexes)
-    {
-        Vertex *v = (Vertex *) lfirst(lc);
-        if ((int) v->index > max_idx)
-            max_idx = (int) v->index;
-    }
+	update_indices(component);
 
-    in_sub = (bool *) palloc0((max_idx + 1) * sizeof(bool));
-    foreach(lc, vertexes)
-    {
-        Vertex *v = (Vertex *) lfirst(lc);
-        in_sub[v->index] = true;
-    }
+	in_zone = (bool *) palloc0(nv * sizeof(bool));
 
-    foreach(lc, vertexes)
-    {
-        Vertex *v = (Vertex *) lfirst(lc);
-        int     degree = 0;
-        ListCell *lc2;
+	foreach(lc, component->vertexes)
+	{
+		Vertex	   *v = (Vertex *) lfirst(lc);
+		Cardinality max_nbr_rows = 0;
+		ListCell   *lc2;
 
-        foreach(lc2, v->adj)
-        {
-            Vertex *nbr = (Vertex *) lfirst(lc2);
+		foreach(lc2, v->adj)
+		{
+			Vertex	   *nbr = (Vertex *) lfirst(lc2);
 
-            if (in_sub[nbr->index])
-            {
-                degree++;
-                if (v->index < nbr->index)
-                    edge_count++;
-            }
-        }
+			if (nbr->rel->rows > max_nbr_rows)
+				max_nbr_rows = nbr->rel->rows;
+		}
 
-        if (degree > 2)
-        {
-            pfree(in_sub);
-            return false;
-        }
-    }
+		if (v->rel->rows < ANCHOR_ABS_MAX &&
+			v->rel->rows * ANCHOR_RATIO < max_nbr_rows)
+		{
+			in_zone[v->index] = true;
 
-    pfree(in_sub);
-    return (edge_count == n - 1);
-}
+			foreach(lc2, v->adj)
+			{
+				Vertex	   *nbr = (Vertex *) lfirst(lc2);
 
+				in_zone[nbr->index] = true;
+			}
+		}
+	}
 
-/**
- * @brief Find chain components among unused vertices.
- *
- * Each connected component is treated as a chain topology.
- *
- * @param root Planner context.
- * @param vertexes Join graph vertices.
- * @param used_vertexes Used marker array.
- *
- * @return List of CHAIN topologies.
- */
-List *
-find_chains(PlannerInfo *root, List *vertexes, bool *used_vertexes)
-{
-	List	   *chains = NIL;	/* List* of Topology*  */
-	ListCell   *lc = NULL;
+	for (int i = 0; i < nv; i++)
+	{
+		if (in_zone[i])
+			marked++;
+	}
 
-	foreach(lc, vertexes)
+	if (marked == 0)
+	{
+		pfree(in_zone);
+		return component;
+	}
+
+	visited = (bool *) palloc0(nv * sizeof(bool));
+
+	foreach(lc, component->vertexes)
+	{
+		Vertex	   *v = (Vertex *) lfirst(lc);
+		List	   *zone_verts;
+		List	   *queue;
+		int			qi;
+		ListCell   *lc2;
+
+		if (!in_zone[v->index] || visited[v->index])
+			continue;
+
+		/* BFS restricted to zone subgraph */
+		queue = list_make1(v);
+		visited[v->index] = true;
+		qi = 0;
+
+		while (qi < list_length(queue))
+		{
+			Vertex	   *cur = (Vertex *) lfirst(list_nth_cell(queue, qi));
+
+			qi++;
+			foreach(lc2, cur->adj)
+			{
+				Vertex	   *nbr = (Vertex *) lfirst(lc2);
+
+				if (in_zone[nbr->index] && !visited[nbr->index])
+				{
+					visited[nbr->index] = true;
+					queue = lappend(queue, nbr);
+				}
+			}
+		}
+		zone_verts = queue;
+
+		if (list_length(zone_verts) >= 2)
+		{
+			List	   *zone_rels = NIL;
+			RelOptInfo *zone_plan;
+
+			foreach(lc2, zone_verts)
+			{
+				Vertex	   *zv = (Vertex *) lfirst(lc2);
+
+				zone_rels = lappend(zone_rels, zv->rel);
+			}
+
+			list_free(root->join_rel_list);
+			root->join_rel_list = NIL;
+			zone_plan = standard_join_search(root, list_length(zone_rels), zone_rels);
+
+			list_free(zone_rels);
+
+			if (zone_plan != NULL && zone_plan->rows <= CONTRACTION_ROW_LIMIT)
+			{
+				/* print_topology(component,ANCHORS); */
+				all_rels = lappend(all_rels, zone_plan);
+				zone_count++;
+			}
+			else
+			{
+				/* dp_sub failed — keep individual rels */
+				foreach(lc2, zone_verts)
+				{
+					Vertex	   *zv = (Vertex *) lfirst(lc2);
+
+					all_rels = lappend(all_rels, zv->rel);
+				}
+			}
+		}
+		else
+		{
+			/* Single-vertex zone — keep as base rel */
+			Vertex	   *zv = (Vertex *) linitial(zone_verts);
+
+			all_rels = lappend(all_rels, zv->rel);
+		}
+		list_free(zone_verts);
+	}
+
+	pfree(visited);
+
+	if (zone_count == 0)
+	{
+		pfree(in_zone);
+		list_free(all_rels);
+		return component;
+	}
+
+	foreach(lc, component->vertexes)
 	{
 		Vertex	   *v = (Vertex *) lfirst(lc);
 
-		if (!used_vertexes[v->index])
-		{
-			List	   *sub = bfs_component(v, used_vertexes);
-			Topology   *topology = (Topology *) palloc0(sizeof(Topology));
-
-			topology->vertexes = sub;
-			topology->form = is_path_graph(sub) ? CHAIN : DENSITY_GRAPH;;
-			/*set_id(root, topology);
-			set_sel_topology(root, topology);
-			set_vol_topology(root, topology);
-			set_complexity_topology(root, topology);*/
-			chains = lappend(chains, topology);
-		}
+		if (!in_zone[v->index])
+			all_rels = lappend(all_rels, v->rel);
 	}
-	return chains;
+
+	pfree(in_zone);
+
+	list_free(component->vertexes);
+	component->vertexes = build_join_graph(root, all_rels);
+	set_complexity_topology(root, component);
+	list_free(all_rels);
+
+	return component;
 }

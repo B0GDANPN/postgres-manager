@@ -583,12 +583,6 @@ struct PlannerInfo
 
 	/* PartitionPruneInfos added in this query's plan. */
 	List	   *partPruneInfos;
-	int			last_topology_id;
-
-	/* Budget fields for heuristic join search */
-	Cost		global_budget;
-	Cost		topology_budget;
-	Cost		spent_budget;
 };
 
 

@@ -10,5 +10,4 @@ static const double k1 = 0.6;
 static const double k2 = 0.25;
 static const double k3 = 0.15;
 extern RelOptInfo *heuristic_join_search(PlannerInfo *root, List *initial_rels);
-RelOptInfo * dp_sub(PlannerInfo *root, List * initial_rels);
 #endif
