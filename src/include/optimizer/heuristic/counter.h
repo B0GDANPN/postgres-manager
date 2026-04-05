@@ -34,6 +34,14 @@ typedef struct HyperNode
 	List	   *candidates;
 
 	/*
+	 * Lightweight cardinality estimate computed during DPhyp enumeration.
+	 * For base rels: est_rows = rel->rows.
+	 * For join nodes: min est_rows across all candidate decompositions.
+	 * Used for level-adaptive pruning on the combinatorial "hump".
+	 */
+	double		est_rows;
+
+	/*
 	 * Cached bitmap of nodes that are connected with this HyperNode with
 	 * simple edges. Just bit OR of 'simple_edges' of all 'nodes'.
 	 */
@@ -155,4 +163,5 @@ typedef struct SubsetIteratorState
 
 extern void initialize_edges(PlannerInfo *root, List *initial_rels, DPHypContext * context);
 extern uint64 count_cc(DPHypContext * context, uint64 max);
+extern RelOptInfo *dphyp_join_search(PlannerInfo *root, int levels_needed, List *initial_rels);
 #endif

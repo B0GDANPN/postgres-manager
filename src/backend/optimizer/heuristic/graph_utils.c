@@ -784,7 +784,6 @@ contract_anchors(PlannerInfo *root, Topology * component)
 			if (nbr->rel->rows > max_nbr_rows)
 				max_nbr_rows = nbr->rel->rows;
 		}
-
 		if (v->rel->rows < ANCHOR_ABS_MAX &&
 			v->rel->rows * ANCHOR_RATIO < max_nbr_rows)
 		{
@@ -873,7 +872,6 @@ contract_anchors(PlannerInfo *root, Topology * component)
 			}
 			else
 			{
-				/* dp_sub failed — keep individual rels */
 				foreach(lc2, zone_verts)
 				{
 					Vertex	   *zv = (Vertex *) lfirst(lc2);

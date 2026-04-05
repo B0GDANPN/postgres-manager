@@ -763,7 +763,7 @@ build_join_rel(PlannerInfo *root, Relids joinrelids, RelOptInfo *outer_rel,
 	joinrel->all_partrels = NULL;
 	joinrel->partexprs = NULL;
 	joinrel->nullable_partexprs = NULL;
-	joinrel->trace = psprintf("(%s, %s)", outer_rel->trace, inner_rel->trace);
+	/*joinrel->trace = psprintf("(%s, %s)", outer_rel->trace, inner_rel->trace);*/
 
 	/* Compute information relevant to the foreign relations. */
 	set_foreign_rel_properties(joinrel, outer_rel, inner_rel);

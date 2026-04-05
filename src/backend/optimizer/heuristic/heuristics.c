@@ -2,6 +2,7 @@
 #include "optimizer/heuristic/graph_utils.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/paths.h"
+#include "port/pg_bitutils.h"
 #include <float.h>
 #include <limits.h>
 #include <string.h>
@@ -49,9 +50,7 @@ goo_cost_cardinality(PlannerInfo *root, List *initial_rels,
 				Cardinality size;
 
 				rel2 = (RelOptInfo *) lfirst(j);
-				if (!clauseless && !has_edge(root, rel1, rel2))
-					continue;
-				if (clauseless && !has_edge(root, rel1, rel2))
+				if (!has_edge(root, rel1, rel2))
 				{
 					/*
 					 * Clauseless mode: allow cross-joins, but only consider
@@ -188,4 +187,84 @@ goo_wrapper(PlannerInfo *root, Topology * topology, bool clauseless)
 	list_free(topology_rels);
 	return result;
 
+}
+
+RelOptInfo *
+dp_sub(PlannerInfo *root, List *initial_rels)
+{
+	RelOptInfo **best_plans = NULL;
+	Cost	   *best_costs = NULL;
+	size_t		n = list_length(initial_rels);
+	size_t		total_sets = ((size_t) 1) << n;
+	RelOptInfo *result = NULL;
+
+	best_plans = (RelOptInfo **) palloc0(total_sets * sizeof(RelOptInfo *));
+	best_costs = (Cost *) palloc0(total_sets * sizeof(Cost));
+	for (size_t i = 0; i < total_sets; i++)
+	{
+		best_costs[i] = DBL_MAX;
+	}
+	for (size_t i = 0; i < n; i++)
+	{
+		size_t		mask = ((size_t) 1) << i;
+		ListCell   *lc = list_nth_cell(initial_rels, i);
+		RelOptInfo *rel = (RelOptInfo *) lfirst(lc);
+
+		best_plans[mask] = rel;
+		best_costs[mask] = rel->cheapest_total_path->total_cost;
+	}
+
+	for (size_t join_bm = 1; join_bm < total_sets; join_bm++)
+	{
+		size_t		left_bm = (-join_bm) & join_bm;
+
+		if (pg_popcount64(join_bm) <= 1)
+		{
+			continue;
+		}
+
+		/*
+		 * if (!is_connected(topology->vertexes, join_bm)) { continue; }
+		 */
+		while (join_bm != left_bm)
+		{
+			size_t		right_bm = join_bm - left_bm;
+			RelOptInfo *left_plan = best_plans[left_bm];
+			RelOptInfo *right_plan = best_plans[right_bm];
+			RelOptInfo *join = NULL;
+			Cost		cost;
+
+			/* Cost		join_cost; */
+
+			if (left_bm >= right_bm || left_plan == NULL || right_plan == NULL)
+			{
+				left_bm = (left_bm - join_bm) & join_bm;
+				continue;
+			}
+
+			if (!has_edge(root, left_plan, right_plan)) /* Maybe unnesesary */
+			{
+				left_bm = (left_bm - join_bm) & join_bm;
+				continue;
+			}
+			join = make_rel(root, left_plan, right_plan);
+			if (join == NULL)
+			{
+				left_bm = (left_bm - join_bm) & join_bm;
+				continue;
+			}
+			cost = join->cheapest_total_path->total_cost;
+			if (cost < best_costs[join_bm])
+			{
+				best_costs[join_bm] = cost;
+				best_plans[join_bm] = join;
+			}
+			left_bm = (left_bm - join_bm) & join_bm;
+		}
+	}
+
+	result = best_plans[total_sets - 1];
+	pfree(best_plans);
+	pfree(best_costs);
+	return result;
 }

@@ -12,10 +12,13 @@
  *
  *-------------------------------------------------------------------------
  */
+#include "optimizer/heuristic/heuristic_manager.h"
+#include "optimizer/heuristic/heuristics.h"
 #include "postgres.h"
+#include "optimizer/heuristic/counter.h"
+#include "optimizer/heuristic/graph_utils.h"
 #include "nodes/pathnodes.h"
 #include "nodes/pg_list.h"
-#include "optimizer/heuristic/heuristic_manager.h"
 #include <float.h>
 #include <limits.h>
 #include <math.h>
@@ -3615,7 +3618,6 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 	else
 	{
 		RelOptInfo *res = NULL;
-		List	   *partial_plans = NIL;
 
 		/*
 		 * Consider the different orders in which we could join the rels,
@@ -3626,8 +3628,7 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		 */
 		root->initial_rels = initial_rels;
 		/* partial_plans = dummy(root, initial_rels); */
-		res = heuristic_join_search(root, initial_rels);
-		/* print_trace(res); */
+		res = heuristic_join_search(root,initial_rels);
 		/* print_trace(res); */
 		/* res = geqo(root, levels_needed, initial_rels); */
 
