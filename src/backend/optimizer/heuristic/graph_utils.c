@@ -22,8 +22,6 @@
 #include <stddef.h>
 #include <string.h>
 
-static const double ANCHOR_RATIO = 100.0;	/* rows < max_nbr / 100 */
-static const double ANCHOR_ABS_MAX = 50000.0;	/* absolute cap          */
 static List *bfs_component(Vertex * start, bool *used_vertexes);
 
 /**
@@ -456,7 +454,7 @@ set_complexity_topology(PlannerInfo *root, Topology * topology)
 
 	initialize_edges(root, initial_rels, &context);
 
-	topology->csg = count_cc(&context, 10000);
+	topology->csg = count_cc(&context, 1000);
 	list_free(context.initial_rels);
 	list_free(context.simple_hypernodes);
 	pfree(context.simple_edges);

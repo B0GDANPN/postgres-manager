@@ -7,6 +7,8 @@
 #include "nodes/pathnodes.h"
 static const uint64 csg_threshold = 350;
 static const uint64 CONTRACTION_ROW_LIMIT = 100000;
+static const double ANCHOR_RATIO = 100.0;	/* rows < max_nbr / 100 */
+static const double ANCHOR_ABS_MAX = 50000.0;	/* absolute cap          */
 typedef struct Vertex
 {
 	RelOptInfo *rel;
