@@ -14,4 +14,6 @@ extern List *plan_star(PlannerInfo *root, Topology * topology);
 extern List *plan_star2(PlannerInfo *root, Topology * topology);
 extern List *plan_dp_sub(PlannerInfo *root, Topology * topology);
 extern RelOptInfo * dp_sub(PlannerInfo *root, List * initial_rels);
+extern RelOptInfo * goo_cost(PlannerInfo *root, List *initial_rels);
+extern RelOptInfo * goo_card(PlannerInfo *root, List *initial_rels);
 #endif
