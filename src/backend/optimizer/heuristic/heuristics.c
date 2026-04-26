@@ -171,6 +171,63 @@ standard_planning_wrapper(PlannerInfo *root, Topology * topology)
 }
 
 RelOptInfo *
+goo_card(PlannerInfo *root, List *initial_rels)
+{
+	while (list_length(initial_rels) > 1)
+	{
+		RelOptInfo *best_rel = NULL;
+		ListCell   *best_lc1 = NULL;
+		ListCell   *best_lc2 = NULL;
+		Cardinality best_size = DBL_MAX;
+		ListCell   *i = NULL;
+		int			first,
+					second;
+
+		foreach(i, initial_rels)
+		{
+			RelOptInfo *rel1 = (RelOptInfo *) lfirst(i);
+			ListCell   *j = NULL;
+
+			for_each_cell(j, initial_rels, lnext(initial_rels, i))
+			{
+				RelOptInfo *rel2 = (RelOptInfo *) lfirst(j);
+				Cardinality size;
+				RelOptInfo *rel = NULL;
+
+				if (!has_edge(root, rel1, rel2))
+				{
+					continue;
+				}
+				rel = make_rel(root, rel1, rel2);
+				size = rel->reltarget->width * rel->rows;
+				if (size < best_size)
+				{
+					best_lc1 = i;
+					best_lc2 = j;
+					best_size = size;
+					best_rel = rel;
+				}
+			}
+		}
+		if (best_rel == NULL)
+		{
+			return NULL;
+		}
+		first = list_cell_number(initial_rels, best_lc1);
+		second = list_cell_number(initial_rels, best_lc2);
+		initial_rels = lappend(initial_rels, best_rel);
+		initial_rels = list_delete_nth_cell(initial_rels, first);
+		if (first < second)
+		{
+			second--;
+		}
+		initial_rels = list_delete_nth_cell(initial_rels, second);
+	}
+
+	return (RelOptInfo *) linitial(initial_rels);
+}
+
+RelOptInfo *
 goo_wrapper(PlannerInfo *root, Topology * topology, bool clauseless)
 {
 	List	   *topology_rels = NIL;
