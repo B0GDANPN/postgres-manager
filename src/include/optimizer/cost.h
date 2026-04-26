@@ -223,4 +223,16 @@ extern double compute_bitmap_pages(PlannerInfo *root, RelOptInfo *baserel,
 								   Cost *cost_p, double *tuples_p);
 extern double compute_gather_rows(Path *path);
 
+typedef void (*set_baserel_size_estimates_hook_type) (
+    PlannerInfo *root, RelOptInfo *rel);
+
+typedef void (*set_joinrel_size_estimates_hook_type) (
+    PlannerInfo *root, RelOptInfo *rel,
+    RelOptInfo *outer_rel, RelOptInfo *inner_rel,
+    SpecialJoinInfo *sjinfo, List *restrictlist);
+
+extern PGDLLIMPORT set_baserel_size_estimates_hook_type
+    set_baserel_size_estimates_hook;
+extern PGDLLIMPORT set_joinrel_size_estimates_hook_type
+    set_joinrel_size_estimates_hook;
 #endif							/* COST_H */
