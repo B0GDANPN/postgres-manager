@@ -109,6 +109,8 @@
 #include "utils/spccache.h"
 #include "utils/tuplesort.h"
 
+set_baserel_size_estimates_hook_type set_baserel_size_estimates_hook = NULL;
+set_joinrel_size_estimates_hook_type set_joinrel_size_estimates_hook = NULL;
 
 #define LOG2(x)  (log(x) / 0.693147180559945)
 
@@ -5365,6 +5367,8 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
 
 	set_rel_width(root, rel);
+	if (set_baserel_size_estimates_hook)
+        set_baserel_size_estimates_hook(root, rel);
 }
 
 /*
@@ -5439,6 +5443,9 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 										   inner_rel->rows,
 										   sjinfo,
 										   restrictlist);
+	if (set_joinrel_size_estimates_hook)
+        set_joinrel_size_estimates_hook(root, rel, outer_rel,
+                                          inner_rel, sjinfo, restrictlist);
 }
 
 /*

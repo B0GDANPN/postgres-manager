@@ -20,18 +20,18 @@
 RelOptInfo *
 heuristic_join_search(PlannerInfo *root, List *initial_rels)
 {
-	List	   *graph = build_join_graph(root, initial_rels);
-	List	   *components = split_components(root, graph);
-	List	   *component_plans = NIL;
+	List       *graph = build_join_graph(root, initial_rels);
+	List       *components = split_components(root, graph);
+	List       *component_plans = NIL;
 	ListCell   *lc = NULL;
 	RelOptInfo *final_plan = NULL;
-
+ 
 	foreach(lc, components)
 	{
 		Topology   *component = (Topology *) lfirst(lc);
 		RelOptInfo *component_plan = NULL;
 
-		set_complexity_topology(root, component);
+		set_complexity_topology(root, component); 
 		if (component->csg <= csg_threshold)
 		{
 			/* print_topology(component,DP); */
@@ -39,8 +39,23 @@ heuristic_join_search(PlannerInfo *root, List *initial_rels)
 			component_plans = lappend(component_plans, component_plan);
 			continue;
 		}
-		component = contract_anchors(root, component);
-		set_complexity_topology(root, component);
+ 
+		for (int iter = 0; iter < MAX_CONTRACTION_ITERATIONS; iter++)
+		{
+			int		old_nv = list_length(component->vertexes);
+			int     new_nv;
+			component = contract_anchors(root, component);
+			set_complexity_topology(root, component);
+ 
+			new_nv = list_length(component->vertexes);
+ 
+			if (new_nv >= old_nv)
+				break;
+ 
+			if (component->csg <= csg_threshold)
+				break;
+		}
+ 
 		if (component->csg <= csg_threshold)
 		{
 			component_plan = standard_planning_wrapper(root, component);
