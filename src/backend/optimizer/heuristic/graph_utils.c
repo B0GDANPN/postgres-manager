@@ -21,7 +21,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
-
+#include "catalog/pg_type_d.h" 
 static List *bfs_component(Vertex * start, bool *used_vertexes);
 
 /**
@@ -737,48 +737,109 @@ make_rel(PlannerInfo *root, RelOptInfo *left, RelOptInfo *right)
 
 }
 
-/**
- * @brief Contract anchor zones into pre-planned virtual vertices.
+static bool
+is_string_join_clause(RestrictInfo *rinfo)
+{
+	OpExpr	   *op;
+	Node	   *left;
+	Node	   *right;
+	Oid			ltype,
+				rtype;
+ 
+	if (!IsA(rinfo->clause, OpExpr))
+		return false;
+ 
+	op = (OpExpr *) rinfo->clause;
+	if (list_length(op->args) != 2)
+		return false;
+ 
+	left = (Node *) linitial(op->args);
+	right = (Node *) lsecond(op->args);
+ 
+	while (left && IsA(left, RelabelType))
+		left = (Node *) ((RelabelType *) left)->arg;
+	while (right && IsA(right, RelabelType))
+		right = (Node *) ((RelabelType *) right)->arg;
+ 
+	if (!IsA(left, Var) || !IsA(right, Var))
+		return false;
+ 
+	ltype = ((Var *) left)->vartype;
+	rtype = ((Var *) right)->vartype;
+ 
+	if (ltype == TEXTOID || ltype == VARCHAROID ||
+		ltype == BPCHAROID || ltype == NAMEOID ||
+		rtype == TEXTOID || rtype == VARCHAROID ||
+		rtype == BPCHAROID || rtype == NAMEOID)
+		return true;
+ 
+	return false;
+}
+ 
+static bool
+has_external_string_join(RelOptInfo *rel, Bitmapset *zone_relids)
+{
+	ListCell   *lc;
+ 
+	foreach(lc, rel->joininfo)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+ 
+		if (bms_is_subset(rinfo->clause_relids, zone_relids))
+			continue;			/* purely internal to zone — skip */
+ 
+		if (is_string_join_clause(rinfo))
+			return true;
+	}
+ 
+	return false;
+}
+ 
+ 
+/*
+ * contract_anchors — modified with string-join safety check.
  *
- * Identifies anchors (small rows relative to neighbours), groups them
- * with 1-hop neighbours into zones, plans each zone via
- * standard_join_search, and rebuilds the join graph with virtual
- * vertices replacing zones. Zones whose plan exceeds
- * CONTRACTION_ROW_LIMIT rows are left uncontracted.
+ * After marking the zone (anchor + 1-hop neighbors), a filtering pass
+ * removes NON-ANCHOR vertices that have text-type join predicates with
+ * vertices outside the zone.  This prevents the Q19-type degradation
+ * where a vertex (e.g. `n`) is locked inside the contracted zone but
+ * needs to be joined early with an external table (e.g. `ak`) via a
+ * non-selective string predicate.
  *
- * @param root      PlannerInfo context.
- * @param component Topology with form=COMPONENT (vertexes consumed
- *                  on success, unchanged on no-op).
- * @return Same Topology pointer with (possibly) fewer vertices.
+ * Anchors themselves are never un-marked: they are tiny (< 50000 rows)
+ * and contracting them is always safe regardless of external joins.
  */
 Topology *
-contract_anchors(PlannerInfo *root, Topology * component)
+contract_anchors(PlannerInfo *root, Topology *component)
 {
 	int			nv = list_length(component->vertexes);
 	bool	   *in_zone;
+	bool	   *is_anchor;		/* NEW: distinguishes anchors from neighbors */
 	bool	   *visited;
 	List	   *all_rels = NIL;
 	ListCell   *lc;
 	int			zone_count = 0;
 	int			marked = 0;
-
+ 
 	if (nv <= 2)
 		return component;
-
+ 
 	update_indices(component);
-
+ 
 	in_zone = (bool *) palloc0(nv * sizeof(bool));
-
+	is_anchor = (bool *) palloc0(nv * sizeof(bool));
+ 
+	/* ---- Phase 1: mark anchors and their 1-hop neighbors ---- */
 	foreach(lc, component->vertexes)
 	{
 		Vertex	   *v = (Vertex *) lfirst(lc);
 		Cardinality max_nbr_rows = 0;
 		ListCell   *lc2;
-
+ 
 		foreach(lc2, v->adj)
 		{
 			Vertex	   *nbr = (Vertex *) lfirst(lc2);
-
+ 
 			if (nbr->rel->rows > max_nbr_rows)
 				max_nbr_rows = nbr->rel->rows;
 		}
@@ -786,30 +847,70 @@ contract_anchors(PlannerInfo *root, Topology * component)
 			v->rel->rows * ANCHOR_RATIO < max_nbr_rows)
 		{
 			in_zone[v->index] = true;
-
+			is_anchor[v->index] = true;	/* v is an anchor */
+ 
 			foreach(lc2, v->adj)
 			{
 				Vertex	   *nbr = (Vertex *) lfirst(lc2);
-
+ 
 				in_zone[nbr->index] = true;
+				/* nbr is NOT an anchor, just a neighbor */
 			}
 		}
 	}
-
+ 
+	/* ---- Phase 2: un-mark non-anchors with external string joins ---- */
+	{
+		/* Collect zone relids for subset check */
+		Bitmapset  *zone_relids = NULL;
+ 
+		foreach(lc, component->vertexes)
+		{
+			Vertex	   *v = (Vertex *) lfirst(lc);
+ 
+			if (in_zone[v->index])
+				zone_relids = bms_add_members(zone_relids, v->rel->relids);
+		}
+ 
+		foreach(lc, component->vertexes)
+		{
+			Vertex	   *v = (Vertex *) lfirst(lc);
+ 
+			/* Only check non-anchor zone members */
+			if (!in_zone[v->index] || is_anchor[v->index])
+				continue;
+ 
+			if (has_external_string_join(v->rel, zone_relids))
+			{
+				in_zone[v->index] = false;
+ 
+				elog(DEBUG1,
+					 "contract_anchors: un-marking vertex relid=%d "
+					 "(has external string join)",
+					 bms_singleton_member(v->rel->relids));
+			}
+		}
+ 
+		bms_free(zone_relids);
+	}
+ 
+	/* ---- Count marked vertices ---- */
 	for (int i = 0; i < nv; i++)
 	{
 		if (in_zone[i])
 			marked++;
 	}
-
+ 
 	if (marked == 0)
 	{
 		pfree(in_zone);
+		pfree(is_anchor);
 		return component;
 	}
-
+ 
+	/* ---- Phase 3: BFS to find connected zone components ---- */
 	visited = (bool *) palloc0(nv * sizeof(bool));
-
+ 
 	foreach(lc, component->vertexes)
 	{
 		Vertex	   *v = (Vertex *) lfirst(lc);
@@ -817,24 +918,23 @@ contract_anchors(PlannerInfo *root, Topology * component)
 		List	   *queue;
 		int			qi;
 		ListCell   *lc2;
-
+ 
 		if (!in_zone[v->index] || visited[v->index])
 			continue;
-
+ 
 		/* BFS restricted to zone subgraph */
 		queue = list_make1(v);
 		visited[v->index] = true;
 		qi = 0;
-
+ 
 		while (qi < list_length(queue))
 		{
 			Vertex	   *cur = (Vertex *) lfirst(list_nth_cell(queue, qi));
-
+ 
 			qi++;
 			foreach(lc2, cur->adj)
 			{
-				Vertex	   *nbr = (Vertex *) lfirst(lc2);
-
+				Vertex	   *nbr = (Vertex *) lfirst(lc2); 
 				if (in_zone[nbr->index] && !visited[nbr->index])
 				{
 					visited[nbr->index] = true;
@@ -843,28 +943,27 @@ contract_anchors(PlannerInfo *root, Topology * component)
 			}
 		}
 		zone_verts = queue;
-
+ 
 		if (list_length(zone_verts) >= 2)
 		{
 			List	   *zone_rels = NIL;
 			RelOptInfo *zone_plan;
-
+ 
 			foreach(lc2, zone_verts)
 			{
 				Vertex	   *zv = (Vertex *) lfirst(lc2);
-
+ 
 				zone_rels = lappend(zone_rels, zv->rel);
 			}
-
+ 
 			list_free(root->join_rel_list);
 			root->join_rel_list = NIL;
 			zone_plan = standard_join_search(root, list_length(zone_rels), zone_rels);
-
+ 
 			list_free(zone_rels);
-
+ 
 			if (zone_plan != NULL && zone_plan->rows <= CONTRACTION_ROW_LIMIT)
 			{
-				/* print_topology(component,ANCHORS); */
 				all_rels = lappend(all_rels, zone_plan);
 				zone_count++;
 			}
@@ -873,7 +972,7 @@ contract_anchors(PlannerInfo *root, Topology * component)
 				foreach(lc2, zone_verts)
 				{
 					Vertex	   *zv = (Vertex *) lfirst(lc2);
-
+ 
 					all_rels = lappend(all_rels, zv->rel);
 				}
 			}
@@ -882,35 +981,37 @@ contract_anchors(PlannerInfo *root, Topology * component)
 		{
 			/* Single-vertex zone — keep as base rel */
 			Vertex	   *zv = (Vertex *) linitial(zone_verts);
-
+ 
 			all_rels = lappend(all_rels, zv->rel);
 		}
 		list_free(zone_verts);
 	}
-
+ 
 	pfree(visited);
-
+ 
 	if (zone_count == 0)
 	{
 		pfree(in_zone);
+		pfree(is_anchor);
 		list_free(all_rels);
 		return component;
 	}
-
+ 
 	foreach(lc, component->vertexes)
 	{
 		Vertex	   *v = (Vertex *) lfirst(lc);
-
+ 
 		if (!in_zone[v->index])
 			all_rels = lappend(all_rels, v->rel);
 	}
-
+ 
 	pfree(in_zone);
-
+	pfree(is_anchor);
+ 
 	list_free(component->vertexes);
 	component->vertexes = build_join_graph(root, all_rels);
 	set_complexity_topology(root, component);
 	list_free(all_rels);
-
+ 
 	return component;
 }

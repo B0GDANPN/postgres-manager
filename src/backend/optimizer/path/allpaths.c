@@ -3628,7 +3628,7 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		 */
 		root->initial_rels = initial_rels;
 		/* partial_plans = dummy(root, initial_rels); */
-		res = heuristic_join_search(root, initial_rels);
+		res = heuristic_join_search(root,initial_rels);
 		/* print_trace(res); */
 		/* res = geqo(root, levels_needed, initial_rels); */
 
