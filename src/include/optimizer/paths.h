@@ -26,6 +26,15 @@ extern PGDLLIMPORT int min_parallel_table_scan_size;
 extern PGDLLIMPORT int min_parallel_index_scan_size;
 extern PGDLLIMPORT bool enable_group_by_reordering;
 
+#define CSG_THRESHOLD (uint64) 350
+#define CONTRACTION_ROW_LIMIT (uint64) 100000
+#define ANCHOR_RATIO (double) 100.0
+#define ANCHOR_ABS_MAX (double) 50000.0
+
+extern PGDLLIMPORT uint64 csg_threshold;
+extern PGDLLIMPORT uint64 contraction_row_limit;
+extern PGDLLIMPORT double anchor_ratio;
+extern PGDLLIMPORT double anchors_abs_max;
 /*
  * Paths parameterized by a parent rel can be considered to be parameterized
  * by any of its children, when we are performing partitionwise joins.  These

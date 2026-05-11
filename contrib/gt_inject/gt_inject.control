@@ -1,0 +1,5 @@
+comment = 'Inject ground-truth cardinalities into PostgreSQL planner'
+default_version = '1.0'
+module_pathname = '$libdir/gt_inject'
+relocatable = false
+schema = public

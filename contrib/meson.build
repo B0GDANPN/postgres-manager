@@ -11,7 +11,7 @@ contrib_doc_dir = dir_doc_extension
 contrib_doc_args = {
   'install_dir': contrib_doc_dir,
 }
-
+subdir('gt_inject')
 subdir('amcheck')
 subdir('auth_delay')
 subdir('auto_explain')

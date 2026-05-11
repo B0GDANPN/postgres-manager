@@ -2220,6 +2220,46 @@ struct config_int ConfigureNamesInt[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"csg_threshold", PGC_USERSET, QUERY_TUNING_ANCHORS,
+			gettext_noop("Sets the threshold of FROM items beyond which GEQO is used."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&csg_threshold,
+		CSG_THRESHOLD, (uint64)1, UINT_MAX,
+		NULL, NULL, NULL
+	},
+	{
+		{"contraction_row_limit", PGC_USERSET, QUERY_TUNING_ANCHORS,
+			gettext_noop("Sets the threshold of FROM items beyond which GEQO is used."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&contraction_row_limit,
+		CONTRACTION_ROW_LIMIT, (uint64)1, UINT_MAX,
+		NULL, NULL, NULL
+	},
+	{
+		{"anchor_ratio", PGC_USERSET, QUERY_TUNING_ANCHORS,
+			gettext_noop("Sets the threshold of FROM items beyond which GEQO is used."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&anchor_ratio,
+		ANCHOR_RATIO, (double)1.0, (double)10000000000000000.0,
+		NULL, NULL, NULL
+	},
+	{
+		{"anchors_abs_max", PGC_USERSET, QUERY_TUNING_ANCHORS,
+			gettext_noop("Sets the threshold of FROM items beyond which GEQO is used."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&anchors_abs_max,
+		ANCHOR_ABS_MAX, (double)1.0, (double)10000000000000000.0,
+		NULL, NULL, NULL
+	},
+	{
 		{"geqo_threshold", PGC_USERSET, QUERY_TUNING_GEQO,
 			gettext_noop("Sets the threshold of FROM items beyond which GEQO is used."),
 			NULL,

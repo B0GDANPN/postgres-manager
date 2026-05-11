@@ -22,8 +22,11 @@
 #include <stddef.h>
 #include <string.h>
 #include "catalog/pg_type_d.h" 
-static List *bfs_component(Vertex * start, bool *used_vertexes);
 
+uint64 csg_threshold = CSG_THRESHOLD;
+uint64 contraction_row_limit = CONTRACTION_ROW_LIMIT;
+double anchor_ratio = ANCHOR_RATIO;
+double anchors_abs_max = ANCHOR_ABS_MAX;
 /**
  * @brief Mark anchor zones (anchor + 1-hop + 2-hop neighbours).
  *
@@ -68,8 +71,8 @@ mark_anchor_zones(List *vertexes, bool *used_vertexes)
 		if (unused_nbrs == 0)
 			continue;
 
-		if (v->rel->rows < ANCHOR_ABS_MAX &&
-			v->rel->rows * ANCHOR_RATIO < max_nbr_rows)
+		if (v->rel->rows < anchors_abs_max &&
+			v->rel->rows * anchor_ratio < max_nbr_rows)
 		{
 			if (!used_vertexes[v->index])
 			{
@@ -843,8 +846,8 @@ contract_anchors(PlannerInfo *root, Topology *component)
 			if (nbr->rel->rows > max_nbr_rows)
 				max_nbr_rows = nbr->rel->rows;
 		}
-		if (v->rel->rows < ANCHOR_ABS_MAX &&
-			v->rel->rows * ANCHOR_RATIO < max_nbr_rows)
+		if (v->rel->rows < anchors_abs_max &&
+			v->rel->rows * anchor_ratio < max_nbr_rows)
 		{
 			in_zone[v->index] = true;
 			is_anchor[v->index] = true;	/* v is an anchor */
@@ -962,7 +965,7 @@ contract_anchors(PlannerInfo *root, Topology *component)
  
 			list_free(zone_rels);
  
-			if (zone_plan != NULL && zone_plan->rows <= CONTRACTION_ROW_LIMIT)
+			if (zone_plan != NULL && zone_plan->rows <= contraction_row_limit)
 			{
 				all_rels = lappend(all_rels, zone_plan);
 				zone_count++;
